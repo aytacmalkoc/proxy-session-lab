@@ -1,6 +1,50 @@
 # Verification notes
 
-## Environment
+## Cross-platform update
+
+The application now targets Python 3.11+ on Linux, macOS, and Windows.
+`psutil==7.2.2` replaces Linux `/proc` reads. A dedicated package and console
+entry point work independently of the current working directory; user cache
+locations no longer depend on a writable source directory. The subprocess
+download deadline replaces Unix-only SIGALRM. Signal handlers are restored on
+exit and Windows supports Ctrl+Break in addition to Ctrl+C.
+
+The development macOS session blocks process enumeration through `sysctl`.
+Its resource-independent checks passed with an explicitly mocked resource
+monitor; this is not a native resource-measurement or browser acceptance result.
+Native Windows/macOS acceptance and a Python-version matrix have not been
+validated. No CI workflow is included. Public proxy endpoints and view counters
+are not part of the automated suite.
+
+Additional regression checks cover platform cache locations, Windows signal
+handling without Unix event-loop methods, parent-enforced downloader timeout
+and reaping, process naming across platforms, inaccessible/exited processes,
+the rate-gate delay, and skipping compressed or oversized diagnostic JSON.
+The TLS rejection test uses a committed, deliberately public test-only key and
+self-signed certificate; it no longer needs an external `openssl` command.
+
+### Results on 2026-10-27
+
+- Full suite: **30 tests passed in 17.292 seconds** on Ubuntu 24.04 arm64,
+  Python 3.12.3, in the official Playwright 1.64.1 Docker image. The container
+  ran as `pwuser`, with an init process to reap orphaned child processes and
+  permissions for Chromium's sandbox namespace syscalls. Chromium sandboxing
+  remained enabled. Real navigation, proxy isolation, TLS rejection, resource
+  sampling, and interrupt cleanup were included.
+- macOS Python 3.12.14: 18 resource-independent checks passed with an explicitly
+  mocked monitor, plus compile, help, network-free dry-run, dependency, and wheel
+  packaging checks. Native process enumeration is blocked by the development
+  session's sandbox, so native browser acceptance is not claimed.
+- The parent-managed Proxifly downloader completed with TLS verification and
+  parsed 5778 candidates. A second read used the cache and returned the same
+  set. These counts are a snapshot; proxy reachability was not tested.
+- The installed CLI and `python -m proxy_session_lab` were both exercised from
+  a temporary directory outside the source checkout.
+- Native Windows acceptance remains unverified. Windows path/signal behavior
+  is covered by isolated regression tests, and the console-interrupt browser
+  test includes a Windows CTRL_BREAK_EVENT path for future native execution.
+
+## Original Linux environment
 
 The local installation was checked on 2026-10-27:
 
@@ -20,7 +64,7 @@ automatic service changes were made.
 `ldd` found no missing libraries for full Chromium or the headless shell.
 A real browser launched with `chromium_sandbox=True`.
 
-## Automated checks
+## Original Linux automated checks
 
 The acceptance suite uses loopback HTTP proxy/HTML/TLS fixtures and real sandboxed
 Chromium. It covers:
@@ -40,8 +84,8 @@ Chromium. It covers:
 
 The local TLS rejection fixture can print an expected server-side certificate
 alert. The passing assertion checks that the browser rejected the certificate.
-Certificate generation uses the machine's existing `openssl`; the runtime does
-not require that command.
+This original suite generated a certificate using the machine's existing
+`openssl`. The current suite uses the public fixture described above.
 
 The first English publication passed 13 of 14 tests in 17.808 seconds; the
 HTTP 429/503 test reproduced the cleanup-accounting race (`active=1`). The
@@ -53,7 +97,7 @@ Tests do not select any third-party target or validation service.
 The follow-up suite passed **18 tests in 18.862 seconds**, including the
 previously failing HTTP 429/503 path and both deterministic cancellation timings.
 
-## Separate download check
+## Original download check
 
 During initial installation, the official HTTP list was downloaded with TLS
 validation and yielded 5606 valid candidates. A second call read the same set

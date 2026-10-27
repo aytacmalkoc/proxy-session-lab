@@ -32,24 +32,53 @@ close Chromium. Allow a short cleanup period before the shell prompt returns.
 
 ## Installation
 
-Use a regular Linux account and a dedicated virtual environment. The source
-requires Python 3.10+; the tested environment uses Python 3.14.8. Only Playwright
-and its transitive dependencies are installed in the venv.
+Use Python **3.11+** and a dedicated virtual environment. Runtime dependencies
+are Playwright and psutil, plus their transitive dependencies. Chromium is
+installed separately for the current operating system and CPU architecture.
+
+### macOS / Linux
 
 ```bash
-git clone git@github.com:aytacmalkoc/proxy-session-lab.git
+git clone https://github.com/aytacmalkoc/proxy-session-lab.git
 cd proxy-session-lab
-cat /etc/os-release
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-lock.txt
-PLAYWRIGHT_BROWSERS_PATH="$PWD/.browsers" \
-  .venv/bin/python -m playwright install chromium
+.venv/bin/python -m pip install --no-deps -e .
+.venv/bin/python -m playwright install chromium
 ./run.sh --help
 ```
 
-`run.sh` resolves its own directory and uses its `.venv` and `.browsers` folders.
-Manual venv activation is unnecessary. The existing local installation remains
-at `~/proxy-browser-test`; the repository name does not require moving it.
+### Windows (PowerShell)
+
+```powershell
+git clone https://github.com/aytacmalkoc/proxy-session-lab.git
+cd proxy-session-lab
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
+.\.venv\Scripts\python.exe -m pip install --no-deps -e .
+.\.venv\Scripts\python.exe -m playwright install chromium
+.\.venv\Scripts\proxy-session-lab.exe --help
+.\.venv\Scripts\proxy-session-lab.exe "https://your-app.example/test"
+```
+
+`run.sh` (macOS/Linux) and `run.ps1` (Windows) use the checkout's own virtual
+environment. The Windows executable above also works without running a
+PowerShell script. After activating the venv, every OS supports:
+
+```text
+proxy-session-lab "https://your-app.example/test"
+python -m proxy_session_lab "https://your-app.example/test"
+```
+
+The installed command works from any working directory. Playwright normally
+uses its OS-specific browser cache. Existing checkout-local `.browsers` folders
+are detected automatically; an explicit `PLAYWRIGHT_BROWSERS_PATH` takes priority.
+Old `python app.py ...` invocations remain supported. Install this update's
+requirements before using an existing `~/proxy-browser-test` checkout.
+
+Use operating-system versions supported by the pinned Playwright release;
+portability does not add support for obsolete Windows/macOS versions. Native
+release executables with a bundled Python interpreter are not included.
 
 ### Linux libraries
 
@@ -127,8 +156,9 @@ the [usage guide](docs/USAGE.md).
 ## Resource control
 
 Auto mode starts at 2 slots, or fewer when the configured budget requires it.
-It samples `/proc` and may increase the limit by one every five seconds when
-current slots are occupied and resources permit.
+It samples CPU, available RAM, and process memory through psutil and may
+increase the limit by one every five seconds when current slots are occupied
+and resources permit.
 
 Approximately 25% of total RAM is reserved, with an extra 128 MiB admission
 margin. Sustained high CPU (three samples at 85% or higher), low RAM, or an
@@ -146,7 +176,7 @@ or available capacity on the target.
   proxy per attempt. Cookies/localStorage are isolated between attempts.
   Normal Chromium child processes are expected.
 - A bounded worker pool and queue avoid creating one pending task per attempt.
-- The HTTP list is downloaded once when no fresh cache exists. Cache lifetime
+- The HTTP list is downloaded once when no fresh user cache exists. Cache lifetime
   is 5 minutes, maximum download size is 2 MiB, and download time is bounded.
   TLS is verified; the downloader does not use environment proxies.
 - Candidates must be literal global unicast IPs with valid ports and `http://`
@@ -157,7 +187,7 @@ or available capacity on the target.
   underlying connection attempts.
 - HTTP proxies can tunnel HTTPS targets using CONNECT. A target's HTTPS scheme
   does not change the proxy endpoint from `http://` to `https://`.
-- Target TLS validation stays enabled. Root execution is rejected and Chromium
+- Target TLS validation stays enabled. Unix root execution is rejected and Chromium
   sandboxing is explicitly enabled.
 - JavaScript runs normally. No browsing interactions, link following, form
   submissions, reload loops, resource blocking, or injected scripts are added.
@@ -171,6 +201,22 @@ or available capacity on the target.
 - Local/private/Tailscale targets receive a preflight warning. Chromium's
   implicit loopback proxy bypass is disabled. No firewall/router settings or
   automatic services are changed.
+
+## Writable user data
+
+The proxy cache is independent of the installation directory:
+
+| OS | Default cache directory |
+| --- | --- |
+| Linux | `$XDG_CACHE_HOME/proxy-session-lab`, or `~/.cache/proxy-session-lab` |
+| macOS | `~/Library/Caches/proxy-session-lab` |
+| Windows | `%LOCALAPPDATA%\ProxySessionLab\Cache` |
+
+`PROXY_SESSION_LAB_CACHE` overrides this directory. Help and dry-run do not
+create it. Logging remains opt-in: `--log-file` uses exactly the path supplied,
+with relative paths resolved from the current working directory. New cache/log
+files request Unix mode 0600; on Windows, access follows the containing folder's
+Windows permissions rather than Unix mode bits.
 
 ## Synthetic traffic identification
 
@@ -222,7 +268,7 @@ See the [logging guide](docs/USAGE.md#performance-and-jsonl-logs).
 | `0` | Budget/candidates completed or deadline reached without recorded session failures; deadline cancellations can still exist |
 | `1` | One or more session failures |
 | `2` | Argument/setup/runtime error or protective stop such as HTTP 429/503 |
-| `130` | SIGINT / Ctrl+C |
+| `130` | SIGINT / Ctrl+C, or Windows SIGBREAK / Ctrl+Break |
 | `143` | SIGTERM; currently also used for SIGHUP |
 
 ## Tests and limitations
@@ -233,8 +279,10 @@ PLAYWRIGHT_BROWSERS_PATH="$PWD/.browsers" \
 ```
 
 Tests use loopback fixtures and real sandboxed Chromium. They do not select a
-third-party target. Test certificate generation uses an existing `openssl`
-command; it is not an application runtime dependency.
+third-party target. The untrusted TLS certificate/key are public, test-only fixtures;
+no external `openssl` executable is required. Unix interrupt tests use SIGINT;
+Windows uses CTRL_BREAK_EVENT against a separate process group. Both exercise
+the real child process and verify browser cleanup.
 
 See [verification notes](docs/VERIFICATION.md) for checks, resource observations,
 and the shutdown regression fix. Public-proxy reliability,
