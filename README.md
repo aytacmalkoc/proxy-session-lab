@@ -82,6 +82,7 @@ must be finite positive numbers; the settle delay can be zero.
 | `--headed` | off | Show Chromium; requires a desktop session |
 | `--probe-url` | none | Optional diagnostics endpoint that you own |
 | `--dry-run` | off | Print configuration without network or browser access |
+| `--log-file` | none | Append structured events and performance data to a `.jsonl` file |
 
 Explicit concurrency must not exceed `--max-concurrency`. The effective limit
 is also bounded by the total session budget.
@@ -195,6 +196,27 @@ exact physical RAM usage. The final output reports the stop reason, elapsed
 time, peak active slots, peak Chromium RSS, minimum available RAM, and errors.
 See [troubleshooting](docs/USAGE.md#interpreting-failures).
 
+Each status update also includes a compact `PERF` line: elapsed time, success
+percentage, completed sessions per second, queue depth, navigation median/p95,
+and sampled peak CPU/RSS. Navigation timings exclude the rate-gate wait and
+include probes, successes, failures, and interrupted navigations. Median/p95 use
+the latest 2048 samples; mean/min/max in JSONL span the full run. CPU peaks are
+peaks of sampled system-wide utilization, not continuous per-process profiling.
+
+### Save structured performance data
+
+```bash
+./run.sh "https://your-app.example/test" \
+  --sessions 100 --max-duration 600 --log-file logs/run.jsonl
+```
+
+This preserves readable console output and appends UTC-timestamped JSON records
+with a run ID. Records include `run_started`, `status`, `performance`,
+`navigation`, `session`, and `summary`, plus general messages. Each final summary
+contains error categories, Chromium `ERR_*` counts, counts, and performance data.
+There is no database. Logging is off by default; dry-run creates no file.
+See the [logging guide](docs/USAGE.md#performance-and-jsonl-logs).
+
 | Exit code | Meaning |
 | --- | --- |
 | `0` | Budget/candidates completed or deadline reached without recorded session failures; deadline cancellations can still exist |
@@ -215,7 +237,7 @@ third-party target. Test certificate generation uses an existing `openssl`
 command; it is not an application runtime dependency.
 
 See [verification notes](docs/VERIFICATION.md) for checks, resource observations,
-and the known cancellation-accounting limitation. Public-proxy reliability,
+and the shutdown regression fix. Public-proxy reliability,
 counter increments, headed mode, and 100-context capacity have not been validated
 by the developer's automated checks. Start at concurrency 2 and rate 1, then
 measure your actual target.

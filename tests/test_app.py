@@ -14,12 +14,14 @@ import ssl
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app
 from proxy_source import parse_proxies
+from telemetry import EventLog, Timings
 
 
 def options(*items):
@@ -169,12 +171,37 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(c.resource_faults, 1)
 
     def test_dry_run_cannot_start_network_or_browser(self):
-        with patch.object(sys, 'argv', ['app.py', 'https://synthetic.test/test', '--dry-run']), \
-             patch('socket.socket', side_effect=AssertionError('Network attempted')), \
-             patch.object(app, 'run', side_effect=AssertionError('Browser attempted')), \
-             patch('sys.stdout', io.StringIO()) as output:
-            self.assertEqual(app.main(), 0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'dry-run.jsonl'
+            with patch.object(sys, 'argv', ['app.py', 'https://synthetic.test/test', '--dry-run', '--log-file', str(path)]), \
+                 patch('socket.socket', side_effect=AssertionError('Network attempted')), \
+                 patch.object(app, 'run', side_effect=AssertionError('Browser attempted')), \
+                 patch('sys.stdout', io.StringIO()) as output:
+                self.assertEqual(app.main(), 0)
+            self.assertFalse(path.exists())
         self.assertEqual(json.loads(output.getvalue())['network_requests'], 0)
+
+    def test_bounded_timings_keep_lifetime_mean_and_recent_percentiles(self):
+        timings = Timings(capacity=3)
+        for value in (1, 2, 3, 4, 5):
+            timings.observe(value)
+        self.assertEqual(timings.snapshot(), {
+            'count': 5, 'window_count': 3, 'mean_s': 3.0, 'min_s': 1,
+            'max_s': 5, 'median_s': 4, 'p95_s': 5})
+        self.assertIsNone(Timings().snapshot()['p95_s'])
+
+    def test_jsonl_appends_runs_with_utc_timestamps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'events.jsonl'
+            for run_id in ('first', 'second'):
+                log = EventLog(path, run_id)
+                log.emit('fixture', value=3)
+                log.close()
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual([r['run_id'] for r in records], ['first', 'second'])
+            self.assertTrue(all(r['timestamp'].endswith('+00:00') for r in records))
+            self.assertTrue(all(r['elapsed_s'] >= 0 for r in records))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 
 class suppress_stderr:
@@ -183,6 +210,50 @@ class suppress_stderr:
         return self.patch.__enter__()
     def __exit__(self, *args):
         return self.patch.__exit__(*args)
+
+
+class CleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancellation_during_close_preserves_cleanup_and_counts(self):
+        for cancel_in_body in (False, True):
+            with self.subTest(cancel_in_body=cancel_in_body):
+                closing, release, opened = asyncio.Event(), asyncio.Event(), asyncio.Event()
+                class Page:
+                    def on(self, *args): pass
+                    async def goto(self, *args, **kwargs):
+                        opened.set()
+                        return SimpleNamespace(status=200)
+                class Context:
+                    closed = False
+                    async def new_page(self): return Page()
+                    async def close(self):
+                        closing.set()
+                        await release.wait()
+                        self.closed = True
+                context = Context()
+                class Browser:
+                    async def new_context(self, **kwargs): return context
+                async def header(*args): return set()
+                runner = app.Runner(options('--sessions', '1', '--settle-seconds',
+                                            '60' if cancel_in_body else '0'), logger=lambda _: None)
+                with patch.object(app, 'install_run_header', header):
+                    task = asyncio.create_task(runner.session(Browser(), 1, 'http://fixture.invalid:8000'))
+                    if cancel_in_body:
+                        await asyncio.wait_for(opened.wait(), 1)
+                        task.cancel()
+                    await asyncio.wait_for(closing.wait(), 1)
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    # Repeated cancellation cannot abandon the in-flight close.
+                    task.cancel()
+                    release.set()
+                    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 1)
+                self.assertTrue(context.closed)
+                self.assertEqual(runner.active, 0)
+                self.assertEqual(len(runner.contexts), 0)
+                self.assertEqual(runner.counts['started'], 1)
+                self.assertEqual(runner.counts['finished'], 1)
+                self.assertEqual(runner.counts['cancelled'], int(cancel_in_body))
+                self.assertEqual(runner.counts['ok'], int(not cancel_in_body))
 
 
 class BrowserTests(unittest.IsolatedAsyncioTestCase):
@@ -281,6 +352,33 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(starts), 2)
         self.assertGreaterEqual(starts[1] - starts[0], .22)
         self.assertTrue(any('203.0.113.7' in line for line in logs))
+
+    async def test_structured_log_contains_real_navigation_and_performance(self):
+        proxy = await self.proxy()
+        bad = await self.proxy()
+        await bad.close()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'run.jsonl'
+            args = options('--sessions', '2', '--log-file', str(path))
+            runner = app.Runner(args, logger=lambda _: None)
+            try:
+                await runner.execute([proxy.endpoint, bad.endpoint], precheck=False)
+                runner.summary()
+            finally:
+                runner.events.close()
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            summary = next(r for r in records if r['event'] == 'summary')
+            self.assertEqual(summary['active'], 0)
+            self.assertEqual(summary['counts']['ok'], 1)
+            self.assertEqual(summary['counts']['failed'], 1)
+            self.assertEqual(summary['performance']['navigation']['count'], 2)
+            self.assertEqual(summary['performance']['success_percent'], 50.0)
+            self.assertEqual(summary['performance']['session']['count'], 2)
+            self.assertTrue(summary['network_errors'])
+            self.assertTrue(all(r['run_id'] == runner.run_id for r in records))
+            self.assertEqual(len([r for r in records if r['event'] == 'navigation']), 2)
+            self.assertEqual(len([r for r in records if r['event'] == 'session']), 2)
+            self.assertEqual(surviving_browser_pids(runner), [])
 
     async def test_localhost_does_not_silently_bypass_proxy(self):
         p = await self.proxy()

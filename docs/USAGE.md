@@ -132,8 +132,80 @@ the cause. No failed candidate is assigned to another attempt within the run.
 - `cancelled`: work interrupted by the deadline or shutdown.
 - `peak_active`: peak session slots, not fully loaded pages.
 
-See the [known cleanup-accounting limitation](VERIFICATION.md#known-limitation)
-if final `active` and the process count disagree.
+After the shutdown regression fix, cancellation during context close waits for
+the bounded cleanup and still updates `active` and `finished`. Repeated shutdown
+signals do not abandon that in-flight cleanup. A successful cleanup finishes
+with `active=0`.
+
+## Performance and JSONL logs
+
+```bash
+./run.sh "https://your-app.example/test" \
+  --sessions 100 --concurrency auto --max-concurrency 8 \
+  --navigation-rate 1 --max-duration 600 \
+  --log-file logs/run.jsonl
+```
+
+The console keeps its status line and adds a `PERF` line approximately every
+five seconds and at shutdown:
+
+```text
+[run_id] PERF elapsed_s=30.0 success=75.0% finished_per_s=0.40 queue=0 nav_median_s=1.20 nav_p95_s=4.80 nav_window=14 CPU_peak=45% RSS_app_peak~48MiB RSS_Chromium_peak~620MiB
+```
+
+This is an illustrative line, not a benchmark. Definitions:
+
+| Metric | Definition |
+| --- | --- |
+| `success` | Successful / (successful + failed), excluding cancellations; `-` before any resolved outcomes |
+| `finished_per_s` | Finished sessions / elapsed run seconds, including failed and cancelled sessions |
+| `queue` | Jobs waiting in the bounded work queue, not all unstarted planned attempts |
+| `nav_median_s`, `nav_p95_s` | Median and nearest-rank p95 of up to the last 2048 navigation elapsed times |
+| `nav_window` | Sample count used by those recent navigation percentiles |
+| `CPU_peak` | Highest sampled system-wide CPU utilization, including other applications |
+| `RSS_*_peak` | Peak sampled RSS sums, with the usual shared-memory caveat |
+
+Navigation timing starts after the rate gate and ends when `page.goto` returns,
+fails, or is cancelled. It includes probes and target navigations but excludes
+the rate wait, context setup, settle delay, and cleanup. Cancelled navigation
+samples are truncated at cancellation, not full successful-load times. Per-session
+elapsed time includes all session phases and cleanup.
+
+The JSONL file is append-only. Reusing a path keeps earlier runs, separated by
+`run_id`. Each line contains a UTC `timestamp`, `elapsed_s`, `run_id`, and `event`:
+
+- `run_started`: configuration and target.
+- `status`: counters, active limit, and sampled resources (raw memory in bytes).
+- `performance`: aggregate timings, throughput, success percentage, and peaks.
+- `navigation`: probe/target role, elapsed seconds, and HTTP status if available.
+- `session`: proxy, result, last work phase, HTTP status, Chromium error code,
+  navigation time when available, total session time, and active count.
+- `summary`: final counts, stop reason, error categories, `network_errors`,
+  and all performance aggregates.
+
+Timing snapshots keep a lifetime count/mean/min/max, with bounded recent samples
+for median/p95. The file is flushed after each event. New files use mode `0600`,
+missing parent directories are created, and `logs/` plus `*.jsonl` are excluded
+from Git. Existing file permissions are left unchanged. No HTML bodies,
+subresource dumps, or raw exception call logs are written. Keep these files local
+if your target URL or configuration is sensitive. There is no automatic log
+rotation; use a fresh path for each experiment if desired.
+
+Dry-run shows the requested path but does not create it. Without `--log-file`,
+performance remains visible in the console and no event file is written.
+
+Print only final summaries from a log using the standard library:
+
+```bash
+.venv/bin/python - <<'PY'
+import json
+from pathlib import Path
+for line in Path('logs/run.jsonl').read_text().splitlines():
+    record = json.loads(line)
+    if record['event'] == 'summary':
+        print(json.dumps(record, indent=2))
+PY
+```
 
 ## Local, private, and Tailscale targets
 
