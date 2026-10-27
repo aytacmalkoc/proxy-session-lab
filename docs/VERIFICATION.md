@@ -22,7 +22,7 @@ A real browser launched with `chromium_sandbox=True`.
 
 ## Automated checks
 
-The 14-test suite uses loopback HTTP proxy/HTML/TLS fixtures and real sandboxed
+The acceptance suite uses loopback HTTP proxy/HTML/TLS fixtures and real sandboxed
 Chromium. It covers:
 
 - Untrusted proxy parsing and duplicate/private-address rejection.
@@ -43,10 +43,15 @@ alert. The passing assertion checks that the browser rejected the certificate.
 Certificate generation uses the machine's existing `openssl`; the runtime does
 not require that command.
 
-After localization, 13 of 14 tests passed in 17.808 seconds. The HTTP 429/503
-test reproduced the known cleanup-accounting race (`active=1` after shutdown).
-This first publication preserves that known issue for a separate fix. Tests
-do not select any third-party target or validation service.
+The first English publication passed 13 of 14 tests in 17.808 seconds; the
+HTTP 429/503 test reproduced the cleanup-accounting race (`active=1`). The
+follow-up fix adds deterministic repeated-cancellation regression coverage,
+bounded timing-statistics checks, JSONL append/UTC/permissions checks, and a
+real-browser structured-log test. Dry-run also checks that no log file is created.
+Tests do not select any third-party target or validation service.
+
+The follow-up suite passed **18 tests in 18.862 seconds**, including the
+previously failing HTTP 429/503 path and both deterministic cancellation timings.
 
 ## Separate download check
 
@@ -66,15 +71,15 @@ a public-proxy end-to-end check, a 100-context capacity benchmark, or headed-mod
 acceptance. Start with concurrency 2 and rate 1, then measure your own target.
 Navigation success does not verify a counter increment.
 
-## Known limitation
+## Shutdown regression fix
 
-If cancellation arrives during an already-running context cleanup, it can skip
-that cleanup's final counter updates. Final `active` can remain nonzero and
-`finished` can lag even after the enclosing browser shutdown removed its
-processes. This was reproduced without network traffic using a context-close
-fixture.
+Previously, cancellation during an already-running context cleanup could skip
+the final counter updates. Final `active` could remain nonzero and `finished`
+could lag after Chromium had exited. A context-close fixture reproduced this
+before the fix, both for a completed session and one cancelled during work.
 
-Normal deadline/SIGINT acceptance cases pass but do not cover every cancellation
-timing. English localization preserves the existing lifecycle and does not fix
-this edge case. Read the process count and stop reason alongside counters when
-it occurs.
+Cleanup now runs as a shielded bounded task. Repeated cancellation is remembered
+and propagated after cleanup; bookkeeping runs in a separate `finally` block.
+The regression checks actual context close completion, empty context tracking,
+`active=0`, exactly one finished count, and correct outcome accounting in both
+timings. The close timeout and enclosing browser shutdown remain in place.

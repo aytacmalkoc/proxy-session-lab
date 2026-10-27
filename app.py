@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 import uuid
 
 from proxy_source import SOURCE, MAX_BYTES, CACHE_SECONDS, parse_proxies
+from telemetry import EventLog, Timings
 
 ROOT = Path(__file__).resolve().parent
 HEADER = 'X-Synthetic-Test-Run'
@@ -93,6 +94,7 @@ def arguments(argv=None):
     p.add_argument('--headed', action='store_true', help='Show the Chromium window')
     p.add_argument('--probe-url', type=valid_url, help='Optional proxy diagnostics URL that you own')
     p.add_argument('--dry-run', action='store_true', help='Print configuration only; no network requests or browser')
+    p.add_argument('--log-file', help='Append structured performance/events to a .jsonl file (default: no file)')
     a = p.parse_args(argv)
     if a.url is None:
         if not sys.stdin.isatty():
@@ -103,6 +105,8 @@ def arguments(argv=None):
             p.error(str(exc))
     if a.concurrency != 'auto' and a.concurrency > a.max_concurrency:
         p.error('--concurrency must not exceed --max-concurrency')
+    if a.log_file and Path(a.log_file).suffix != '.jsonl':
+        p.error('--log-file must use the .jsonl extension')
     return a
 
 
@@ -345,10 +349,14 @@ class Runner:
         self.args = args
         self.run_id = run_id or uuid.uuid4().hex
         self.log_sink = logger or print
+        self.events = EventLog(args.log_file, self.run_id)
         self.stopping = asyncio.Event()
         self.stop_reason = None
         self.counts = Counter()
         self.errors = Counter()
+        self.network_errors = Counter()
+        self.navigation_times = Timings()
+        self.session_times = Timings()
         self.active = 0
         self.peak_active = 0
         self.reserved = 0
@@ -359,11 +367,15 @@ class Runner:
         self.queue = asyncio.Queue(maxsize=self.controller.maximum)
         self.contexts = set()
         self.peak_browser_rss = 0
+        self.peak_app_rss = self.resources.app_rss
+        self.peak_helper_rss = 0
+        self.peak_cpu = 0.0
         self.minimum_available = self.resources.available
         self.began = time.monotonic()
 
-    def log(self, message):
+    def log(self, message, event='message', **fields):
         self.log_sink(f'[{self.run_id}] {message}')
+        self.events.emit(event, message=message, **fields)
 
     def stop(self, reason):
         if not self.stopping.is_set():
@@ -374,7 +386,28 @@ class Runner:
     def sample_resources(self):
         self.resources = self.monitor.sample()
         self.peak_browser_rss = max(self.peak_browser_rss, self.resources.chromium_rss)
+        self.peak_app_rss = max(self.peak_app_rss, self.resources.app_rss)
+        self.peak_helper_rss = max(self.peak_helper_rss, self.resources.helper_rss)
+        self.peak_cpu = max(self.peak_cpu, self.resources.cpu)
         self.minimum_available = min(self.minimum_available, self.resources.available)
+
+    def performance(self):
+        elapsed = max(time.monotonic() - self.began, .000001)
+        resolved = self.counts['ok'] + self.counts['failed']
+        return {
+            'elapsed_s': elapsed,
+            'success_percent': 100 * self.counts['ok'] / resolved if resolved else None,
+            'started_per_s': self.counts['started'] / elapsed,
+            'finished_per_s': self.counts['finished'] / elapsed,
+            'queue_depth': self.queue.qsize(),
+            'navigation': self.navigation_times.snapshot(),
+            'session': self.session_times.snapshot(),
+            'peak_cpu_percent': self.peak_cpu,
+            'peak_app_rss_mib': self.peak_app_rss / MIB,
+            'peak_chromium_rss_mib': self.peak_browser_rss / MIB,
+            'peak_helper_rss_mib': self.peak_helper_rss / MIB,
+            'min_available_ram_mib': self.minimum_available / MIB,
+        }
 
     def status(self, final=False):
         r, c = self.resources, self.counts
@@ -384,7 +417,21 @@ class Runner:
                  f'limit={self.controller.limit} navigations={self.gate.starts} '
                  f'RAM_available={r.available / MIB:.0f}MiB CPU={r.cpu:.0f}% '
                  f'RSS_app~{r.app_rss / MIB:.0f}MiB RSS_Chromium~{r.chromium_rss / MIB:.0f}MiB '
-                 f'RSS_helpers~{r.helper_rss / MIB:.0f}MiB Chromium_processes={r.chromium_processes}')
+                 f'RSS_helpers~{r.helper_rss / MIB:.0f}MiB Chromium_processes={r.chromium_processes}',
+                 event='status', final=final, counts=dict(c), active=self.active,
+                 limit=self.controller.limit, navigations=self.gate.starts,
+                 resources=vars(r))
+        perf = self.performance()
+        nav = perf['navigation']
+        median = f'{nav["median_s"]:.2f}' if nav['median_s'] is not None else '-'
+        p95 = f'{nav["p95_s"]:.2f}' if nav['p95_s'] is not None else '-'
+        success = f'{perf["success_percent"]:.1f}%' if perf['success_percent'] is not None else '-'
+        self.log(f'PERF elapsed_s={perf["elapsed_s"]:.1f} success={success} '
+                 f'finished_per_s={perf["finished_per_s"]:.2f} queue={perf["queue_depth"]} '
+                 f'nav_median_s={median} nav_p95_s={p95} nav_window={nav["window_count"]} '
+                 f'CPU_peak={self.peak_cpu:.0f}% RSS_app_peak~{self.peak_app_rss / MIB:.0f}MiB '
+                 f'RSS_Chromium_peak~{self.peak_browser_rss / MIB:.0f}MiB',
+                 event='performance', final=final, **perf)
 
     async def watch(self):
         next_report = time.monotonic()
@@ -397,11 +444,32 @@ class Runner:
                 next_report = time.monotonic() + 5
             await asyncio.sleep(1)
 
-    async def navigate(self, page, url):
+    async def navigate(self, page, url, role='target'):
         await self.gate.acquire()
         start = time.monotonic()
-        response = await page.goto(url, wait_until='domcontentloaded', timeout=self.args.navigation_timeout * 1000)
-        return response, time.monotonic() - start
+        response = None
+        try:
+            response = await page.goto(url, wait_until='domcontentloaded', timeout=self.args.navigation_timeout * 1000)
+            return response, time.monotonic() - start
+        finally:
+            duration = time.monotonic() - start
+            self.navigation_times.observe(duration)
+            self.events.emit('navigation', role=role, duration_s=duration,
+                             http_status=response.status if response else None)
+
+    async def close_session(self, context, header_tasks):
+        if context is not None:
+            try:
+                await asyncio.wait_for(context.close(), 3)
+            except Exception:
+                self.stop('Context cleanup failed; closing Chromium')
+            finally:
+                self.contexts.discard(context)
+        pending = tuple(header_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def session(self, browser, number, proxy):
         context = None
@@ -410,6 +478,8 @@ class Runner:
         nav_seconds = None
         status = None
         outcome = 'cancelled'
+        phase = 'context_setup'
+        network_error = None
         self.counts['started'] += 1
         self.active += 1
         self.peak_active = max(self.peak_active, self.active)
@@ -431,7 +501,8 @@ class Runner:
             page.on('response', response_received)
 
             if self.args.probe_url:
-                probe, _ = await self.navigate(page, self.args.probe_url)
+                phase = 'probe'
+                probe, _ = await self.navigate(page, self.args.probe_url, role='probe')
                 if probe is None or probe.status >= 400:
                     outcome = 'probe_http_error'
                     self.counts['failed'] += 1
@@ -457,6 +528,7 @@ class Runner:
                     'origin': f'{probe_origin.scheme}://{probe_origin.netloc}', 'storageTypes': 'all'})
                 await probe_cdp.detach()
                 status = None
+            phase = 'target_navigation'
             response, nav_seconds = await self.navigate(page, self.args.url)
             status = response.status if response else status
             if response is None or status >= 400:
@@ -464,6 +536,7 @@ class Runner:
                 self.counts['failed'] += 1
                 self.errors[outcome] += 1
             else:
+                phase = 'settle'
                 await asyncio.sleep(self.args.settle_seconds)
                 outcome = 'navigation_succeeded'
                 self.counts['ok'] += 1
@@ -489,24 +562,36 @@ class Runner:
             # the structured category and Chromium network error code, if any.
             match = re.search(r'net::(ERR_[A-Z0-9_]+)', str(exc))
             if match:
+                network_error = match[1]
+                self.network_errors[network_error] += 1
                 outcome += f'({match[1]})'
         finally:
-            if context is not None:
-                try:
-                    await asyncio.wait_for(context.close(), 3)
-                except Exception:
-                    self.stop('Context cleanup failed; closing Chromium')
-                self.contexts.discard(context)
-            for task in header_tasks:
-                task.cancel()
-            if header_tasks:
-                await asyncio.gather(*header_tasks, return_exceptions=True)
-            self.active -= 1
-            self.counts['finished'] += 1
-            nav_text = f'{nav_seconds:.2f}' if nav_seconds is not None else '-'
-            self.log(f'session={number} proxy={safe_url(proxy)} HTTP={status or "-"} '
-                     f'result={outcome} navigation_s={nav_text} '
-                     f'session_s={time.monotonic() - started:.2f} active={self.active}')
+            # Keep close and bookkeeping alive even if another cancellation
+            # arrives after the session has already entered its finally block.
+            cleanup = asyncio.create_task(self.close_session(context, header_tasks))
+            cancelled_during_cleanup = False
+            try:
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        cancelled_during_cleanup = True
+                cleanup.result()
+            finally:
+                self.active -= 1
+                self.counts['finished'] += 1
+                duration = time.monotonic() - started
+                self.session_times.observe(duration)
+                nav_text = f'{nav_seconds:.2f}' if nav_seconds is not None else '-'
+                self.log(f'session={number} proxy={safe_url(proxy)} HTTP={status or "-"} '
+                         f'result={outcome} phase={phase} navigation_s={nav_text} '
+                         f'session_s={duration:.2f} active={self.active}',
+                         event='session', session_number=number, proxy=safe_url(proxy),
+                         http_status=status, result=outcome, phase=phase,
+                         network_error=network_error, navigation_s=nav_seconds,
+                         duration_s=duration, active=self.active)
+            if cancelled_during_cleanup:
+                raise asyncio.CancelledError()
 
     async def worker(self, browser):
         while True:
@@ -556,7 +641,8 @@ class Runner:
         """candidates injection is an internal seam for loopback-only tests."""
         from playwright.async_api import async_playwright
         self.log(f'target={safe_url(self.args.url)} synthetic_sessions={self.args.sessions} '
-                 f'initial_concurrency={self.controller.limit} rate={self.args.navigation_rate}/s')
+                 f'initial_concurrency={self.controller.limit} rate={self.args.navigation_rate}/s',
+                 event='run_started', target=safe_url(self.args.url), config=vars(self.args))
         self.log('Summed RSS includes shared pages; it is not exact physical RAM consumption.')
         browser = None
         try:
@@ -584,7 +670,12 @@ class Runner:
         self.log(f'reason={self.stop_reason or "session budget/proxy candidates exhausted"} '
                  f'elapsed_s={time.monotonic() - self.began:.2f} peak_active={self.peak_active} '
                  f'peak_Chromium_RSS~{self.peak_browser_rss / MIB:.0f}MiB '
-                 f'min_RAM_available={self.minimum_available / MIB:.0f}MiB errors={dict(self.errors)}')
+                 f'min_RAM_available={self.minimum_available / MIB:.0f}MiB errors={dict(self.errors)} '
+                 f'network_errors={dict(self.network_errors)}',
+                 event='summary', reason=self.stop_reason or 'session budget/proxy candidates exhausted',
+                 counts=dict(self.counts), active=self.active, peak_active=self.peak_active,
+                 errors=dict(self.errors), network_errors=dict(self.network_errors),
+                 performance=self.performance())
         self.log('Navigation success does not prove a counter increment or a real person/device visit. '
                  'Without real-target measurements, start with 2 active synthetic sessions.')
 
@@ -618,7 +709,10 @@ async def run(args):
         await asyncio.gather(stop_wait, return_exceptions=True)
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             loop.remove_signal_handler(sig)
-        runner.summary()
+        try:
+            runner.summary()
+        finally:
+            runner.events.close()
 
 
 def main():
@@ -636,7 +730,11 @@ def main():
     if os.geteuid() == 0:
         print('Do not run this application as root; use a regular user account.', file=sys.stderr)
         return 2
-    return asyncio.run(run(args))
+    try:
+        return asyncio.run(run(args))
+    except OSError as exc:
+        print(f'File/runtime I/O error: {exc}', file=sys.stderr)
+        return 2
 
 
 if __name__ == '__main__':
