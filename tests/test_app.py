@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import signal
 import ssl
+import subprocess
 import sys
 import tempfile
 import time
@@ -19,9 +20,9 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import app
-from proxy_source import parse_proxies
-from telemetry import EventLog, Timings
+from proxy_session_lab import app
+from proxy_session_lab.proxy_source import parse_proxies
+from proxy_session_lab.telemetry import EventLog, Timings
 
 
 def options(*items):
@@ -201,7 +202,8 @@ class UnitTests(unittest.TestCase):
             self.assertEqual([r['run_id'] for r in records], ['first', 'second'])
             self.assertTrue(all(r['timestamp'].endswith('+00:00') for r in records))
             self.assertTrue(all(r['elapsed_s'] >= 0 for r in records))
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            if os.name != 'nt':
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 
 class suppress_stderr:
@@ -406,33 +408,28 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
               f'available_min_MiB={runner.minimum_available/app.MIB:.1f} increased={any("Auto admission" in x for x in logs)}')
 
     async def test_http_proxy_connect_https_keeps_tls_validation(self):
-        with tempfile.TemporaryDirectory() as d:
-            cert, key = str(Path(d) / 'cert.pem'), str(Path(d) / 'key.pem')
-            proc = await asyncio.create_subprocess_exec('openssl', 'req', '-x509', '-newkey', 'rsa:2048',
-                     '-nodes', '-keyout', key, '-out', cert, '-days', '1', '-subj', '/CN=synthetic.test',
-                     '-addext', 'subjectAltName=DNS:synthetic.test',
-                     stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-            self.assertEqual(await proc.wait(), 0)
-            tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            tls.load_cert_chain(cert, key)
-            async def handler(reader, writer):
-                writer.close()
-            server = await asyncio.start_server(handler, '127.0.0.1', 0, ssl=tls)
-            p = await self.proxy()
-            p.tunnel_port = server.sockets[0].getsockname()[1]
-            try:
-                args = options('--sessions', '1', '--navigation-timeout', '3')
-                args.url = 'https://synthetic.test/test'
-                runner, _ = await self.execute(args, [p])
-                self.assertEqual(runner.errors['tls'], 1)
-                self.assertTrue(any(r[1] == 'synthetic.test:443' for r in p.records))
-                self.assertTrue(p.endpoint.startswith('http://'))
-            finally:
-                server.close()
-                await server.wait_closed()
+        fixtures = Path(__file__).parent / 'fixtures'
+        cert, key = str(fixtures / 'untrusted-cert.pem'), str(fixtures / 'untrusted-key.pem')
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(cert, key)
+        async def handler(reader, writer):
+            writer.close()
+        server = await asyncio.start_server(handler, '127.0.0.1', 0, ssl=tls)
+        p = await self.proxy()
+        p.tunnel_port = server.sockets[0].getsockname()[1]
+        try:
+            args = options('--sessions', '1', '--navigation-timeout', '3')
+            args.url = 'https://synthetic.test/test'
+            runner, _ = await self.execute(args, [p])
+            self.assertEqual(runner.errors['tls'], 1)
+            self.assertTrue(any(r[1] == 'synthetic.test:443' for r in p.records))
+            self.assertTrue(p.endpoint.startswith('http://'))
+        finally:
+            server.close()
+            await server.wait_closed()
 
     async def test_cli_help_dryrun_missing_url_and_duration(self):
-        script = str(Path(app.__file__))
+        script = str(Path(app.__file__).parents[1] / 'app.py')
         p = await self.proxy()
         for args, expected in [(['--help'], 0), ([], 2),
                                (['http://synthetic.test/test', '--dry-run'], 0)]:
@@ -458,20 +455,22 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(surviving_browser_pids(timed_runner), [])
         self.assertLessEqual(sum(len([r for r in x.records if r[1].endswith('/test')]) for x in all_proxies), 2)
 
-    async def test_sigint_real_process_reaps_browser(self):
+    async def test_console_interrupt_real_process_reaps_browser(self):
         p = await self.proxy()
         code = '''import asyncio, sys
 sys.path.insert(0, sys.argv[1])
-import app
+from proxy_session_lab import app
 async def fixture(_): return [sys.argv[2]], "local-fixture"
 app.load_candidates = fixture
 sys.exit(asyncio.run(app.run(app.arguments(["http://synthetic.test/test", "--sessions", "1", "--settle-seconds", "60"]))))
 '''
-        proc = await asyncio.create_subprocess_exec(sys.executable, '-c', code, str(Path(app.__file__).parent), p.endpoint,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env={**os.environ, 'PYTHONUNBUFFERED': '1'})
+        process_options = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {}
+        proc = await asyncio.create_subprocess_exec(sys.executable, '-c', code, str(Path(app.__file__).parents[1]), p.endpoint,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    env={**os.environ, 'PYTHONUNBUFFERED': '1'}, **process_options)
         identities = set()
         try:
-            for _ in range(100):
+            for _ in range(300):
                 snap = app.process_snapshot()
                 identities.update((pid, snap[pid][1]) for pid in app.descendants(snap, proc.pid))
                 if any('/evidence?' in r[1] for r in p.records):
@@ -479,10 +478,10 @@ sys.exit(asyncio.run(app.run(app.arguments(["http://synthetic.test/test", "--ses
                 await asyncio.sleep(.05)
             self.assertTrue(p.records, 'Child browser did not navigate')
             self.assertTrue(identities)
-            proc.send_signal(signal.SIGINT)
+            proc.send_signal(signal.CTRL_BREAK_EVENT if os.name == 'nt' else signal.SIGINT)
             out, err = await asyncio.wait_for(proc.communicate(), 8)
             self.assertEqual(proc.returncode, 130, (out, err))
-            self.assertIn(b'SIGINT', out)
+            self.assertIn(b'SIGBREAK' if os.name == 'nt' else b'SIGINT', out)
             self.assertIn(b'active=0', out)
             snap = app.process_snapshot()
             self.assertEqual([pid for pid, birth in identities if pid in snap and snap[pid][1] == birth], [])

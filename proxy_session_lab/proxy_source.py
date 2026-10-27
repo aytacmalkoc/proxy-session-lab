@@ -1,6 +1,5 @@
 """Bounded, TLS-verified Proxifly downloader and untrusted-list parser."""
 import ipaddress
-import signal
 import ssl
 import sys
 import urllib.request
@@ -60,11 +59,7 @@ def download():
 
 
 if __name__ == '__main__':
-    # Parent also enforces a wall-clock timeout and reaps this short-lived helper.
-    def expired(*_):
-        raise TimeoutError('Proxy list download exceeded its total time limit')
-    signal.signal(signal.SIGALRM, expired)
-    signal.alarm(12)
+    # Parent enforces a wall-clock timeout and reaps this helper on every OS.
     try:
         sys.stdout.buffer.write(download())
     except Exception as exc:

@@ -1,6 +1,8 @@
 # Usage guide
 
-Run these examples from the project directory with a target you own. The
+The examples use the macOS/Linux `./run.sh` launcher. On Windows, replace it
+with `.\.venv\Scripts\proxy-session-lab.exe` (or `proxy-session-lab` after
+activating the virtual environment). Use a target you own. The
 existing installation is at `~/proxy-browser-test`; a fresh clone normally uses
 the `proxy-session-lab` directory.
 
@@ -89,8 +91,13 @@ target. Main HTTP 429/503 stops the entire run.
 To report egress IP, your endpoint must return a successful response with:
 
 - A JSON Content-Type.
+- No compression (`Content-Encoding` absent or `identity`); compressed wire
+  length is not a limit on the decoded body size.
 - A numeric Content-Length of at most 4096 bytes.
 - A JSON object with a parseable IP string, such as `{"ip":"203.0.113.7"}`.
+
+Compressed, oversized, or length-unknown responses are not copied into Python
+for IP inspection; a successful probe can still allow target navigation.
 
 The output is labeled `diagnostic_reported_egress_ip`: it is the endpoint's
 report. Other successful probe responses allow the target attempt without
@@ -184,7 +191,7 @@ The JSONL file is append-only. Reusing a path keeps earlier runs, separated by
   and all performance aggregates.
 
 Timing snapshots keep a lifetime count/mean/min/max, with bounded recent samples
-for median/p95. The file is flushed after each event. New files use mode `0600`,
+for median/p95. The file is flushed after each event. New files request mode `0600` on Unix (Windows uses its folder permissions),
 missing parent directories are created, and `logs/` plus `*.jsonl` are excluded
 from Git. Existing file permissions are left unchanged. No HTML bodies,
 subresource dumps, or raw exception call logs are written. Keep these files local
@@ -222,7 +229,9 @@ fixtures through an internal Python seam, not a public CLI option.
 
 Press Ctrl+C once and wait for cleanup and the shell prompt. New work stops;
 active and pending jobs are cancelled. The enclosing browser is closed before
-the summary. SIGTERM and SIGHUP also request shutdown. No automatic service is
+the summary. SIGTERM and, where available, SIGHUP also request shutdown. Windows additionally
+handles Ctrl+Break (SIGBREAK). Forced termination by the operating system does
+not run Python cleanup. No automatic service is
 installed and the app does not restart itself.
 
 ## Installation troubleshooting
