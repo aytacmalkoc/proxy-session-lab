@@ -1,11 +1,28 @@
 """Operating-system integration kept outside the browser session engine."""
 from dataclasses import dataclass
+import hashlib
+import json
 import os
 from pathlib import Path
 import signal
 import sys
 
 import psutil
+
+
+def network_snapshot():
+    """Local-only configuration digest: never record IPs, MACs or NIC names."""
+    try:
+        stats = psutil.net_if_stats()
+        addresses = psutil.net_if_addrs()
+        state = sorted((name, value.isup, value.mtu,
+                        sorted((int(a.family), a.address) for a in addresses.get(name, [])))
+                       for name, value in stats.items())
+        digest = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
+        return {'available': True, 'state_id': digest, 'interface_count': len(stats),
+                'up_interface_count': sum(value.isup for value in stats.values())}
+    except (OSError, psutil.Error):
+        return {'available': False}
 
 
 @dataclass

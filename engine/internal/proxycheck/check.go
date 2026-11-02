@@ -34,28 +34,31 @@ type Config struct {
 	RootCAs        *x509.CertPool `json:"-"`
 }
 type Report struct {
-	Observed         map[string]string      `json:"observed,omitempty"`
-	Test             string                 `json:"test"`
-	Details          any                    `json:"details,omitempty"`
-	ID               string                 `json:"id"`
-	Proxy            string                 `json:"proxy"`
-	URL              string                 `json:"url"`
-	Profile          string                 `json:"profile"`
-	TransportOK      bool                   `json:"transport_ok"`
-	TargetOK         bool                   `json:"target_ok"`
-	HTTPStatus       int                    `json:"http_status,omitempty"`
-	HTTPVersion      string                 `json:"http_version,omitempty"`
-	FailedStage      string                 `json:"failed_stage,omitempty"`
-	ErrorCode        string                 `json:"error_code,omitempty"`
-	StopRun          bool                   `json:"stop_run,omitempty"`
-	TLS              proxytransport.TLSInfo `json:"tls"`
-	Stages           []proxytransport.Stage `json:"stages"`
-	BodyBytes        int                    `json:"body_bytes"`
-	BodySHA256       string                 `json:"body_sha256,omitempty"`
-	BodyTruncated    bool                   `json:"body_truncated"`
-	ReportedEgressIP string                 `json:"reported_egress_ip,omitempty"`
-	RetryAfter       string                 `json:"retry_after,omitempty"`
-	ElapsedMS        float64                `json:"elapsed_ms"`
+	Observed             map[string]string      `json:"observed,omitempty"`
+	Test                 string                 `json:"test"`
+	Details              any                    `json:"details,omitempty"`
+	ID                   string                 `json:"id"`
+	Proxy                string                 `json:"proxy"`
+	URL                  string                 `json:"url"`
+	Profile              string                 `json:"profile"`
+	TransportOK          bool                   `json:"transport_ok"`
+	HTTPResponseReceived bool                   `json:"http_response_received"`
+	BodyReadOK           bool                   `json:"body_read_ok"`
+	BodyComplete         bool                   `json:"body_complete"`
+	TargetOK             bool                   `json:"target_ok"`
+	HTTPStatus           int                    `json:"http_status,omitempty"`
+	HTTPVersion          string                 `json:"http_version,omitempty"`
+	FailedStage          string                 `json:"failed_stage,omitempty"`
+	ErrorCode            string                 `json:"error_code,omitempty"`
+	StopRun              bool                   `json:"stop_run,omitempty"`
+	TLS                  proxytransport.TLSInfo `json:"tls"`
+	Stages               []proxytransport.Stage `json:"stages"`
+	BodyBytes            int                    `json:"body_bytes"`
+	BodySHA256           string                 `json:"body_sha256,omitempty"`
+	BodyTruncated        bool                   `json:"body_truncated"`
+	ReportedEgressIP     string                 `json:"reported_egress_ip,omitempty"`
+	RetryAfter           string                 `json:"retry_after,omitempty"`
+	ElapsedMS            float64                `json:"elapsed_ms"`
 }
 
 func safeURL(raw string) string {
@@ -155,6 +158,7 @@ func Check(parent context.Context, cfg Config) (report Report) {
 			finish()
 		}
 	}
+	err = proxytransport.ContextError(ctx, err)
 	step := proxytransport.Stage{Name: "http", ElapsedMS: float64(time.Since(requestStart)) / float64(time.Millisecond), OK: err == nil}
 	if err != nil {
 		step.Code = proxytransport.Code(err)
@@ -164,6 +168,7 @@ func Check(parent context.Context, cfg Config) (report Report) {
 		return
 	}
 	report.HTTPStatus = res.StatusCode
+	report.HTTPResponseReceived = true
 	report.HTTPVersion = res.Proto
 	step.Status = res.StatusCode
 	report.Stages = append(report.Stages, step)
@@ -182,8 +187,11 @@ func Check(parent context.Context, cfg Config) (report Report) {
 
 	bodyStart := time.Now()
 	body, err := io.ReadAll(io.LimitReader(res.Body, (64<<10)+1))
+	err = proxytransport.ContextError(ctx, err)
 	report.BodyBytes = len(body)
 	report.BodyTruncated = len(body) > 64<<10
+	report.BodyReadOK = err == nil
+	report.BodyComplete = err == nil && !report.BodyTruncated
 	step = proxytransport.Stage{Name: "body", ElapsedMS: float64(time.Since(bodyStart)) / float64(time.Millisecond), OK: err == nil}
 	if err != nil {
 		step.Code = proxytransport.Code(err)

@@ -174,6 +174,47 @@ the percentage; the per-mode admission margin remains. The run configuration
 and dry-run record the effective reserve. Rate tokens cover both Go checks and browser navigations;
 hybrid with a probe performs both network and browser validation.
 
+### Hybrid scheduling and stage diagnostics
+
+The single global rate gate prioritizes a browser navigation that is ready after
+its Go check over network checks that have not started. FIFO order is retained
+within each priority. This avoids putting all browser navigations behind a full
+wave of prechecks while preserving the configured global start interval, bounded
+worker count, overall deadline, and one-attempt-per-candidate budget.
+
+`navigation_started`, `navigation`, `network_check_started`, and `network_check`
+events carry `session_number` and rate-wait evidence. The first browser navigation
+after a passing precheck additionally reports `hybrid_handoff_s`; its bounded
+aggregate appears under `performance.hybrid_handoff`. Rate-gate waiters are
+reported separately from the work queue, including browser/network counts.
+
+HTTP results distinguish `http_response_received`, `body_read_ok`, and
+`body_complete`. A successful bounded prefix read has `body_read_ok=true`; if the
+64 KiB cap was reached, `body_complete=false` and `body_truncated=true`. HTTP 200
+followed by a body timeout retains its HTTP evidence, but remains a failed target
+check. Existing `transport_ok` still requires a successful bounded body read;
+`target_ok` and session success are not relaxed.
+
+The total `timeout` counter includes both Go and browser timeouts. Separate
+`network_timeout`, `browser_timeout`, `timeouts_by_stage`, and `network_stages`
+explain the breakdown. An expired/cancelled context is preserved when socket
+closure races with I/O errors, rather than turning a deadline into a generic
+connection error.
+
+Browser lifecycle events (`context_opening`, `context_opened`, `context_closing`,
+`context_closed`/`context_close_failed`) and main-document
+`browser_request_failed` events correlate failures by session. A local-only
+interface/address configuration digest is sampled during the run and again at
+request failure. `network_state` / `network_state_change` record only a hash and
+interface counts: no IPs, MACs, or interface names are written, and no external
+IP-check request is added. This sensor does not cover every routing/DNS change,
+nor does it prove the cause of Chromium's `ERR_NETWORK_CHANGED`. Transient changes
+between samples may be missed. There is no automatic browser retry or error bypass.
+
+For an engine comparison, use the same owned endpoint, explicit proxy file and
+seed for each mode/profile, preserving each run in a separate JSONL file. Changing
+the free-list sample or target URL cannot isolate an integration regression.
+
 The existing CPU sample is system-wide, and helper RSS now includes the Go worker
 and any FFmpeg children. Those values are not comparable to kickpop's per-cohort
 CPU percentages without normalizing the measurement. Overlapping per-job Go CPU

@@ -110,6 +110,15 @@ func Code(err error) string {
 	}
 	return "connection_error"
 }
+
+// ContextError preserves cancellation/deadline evidence when closing the socket
+// races with an I/O error such as "use of closed network connection".
+func ContextError(ctx context.Context, err error) error {
+	if err != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
+}
 func add(stages *[]Stage, name string, start time.Time, err error, status int) error {
 	s := Stage{Name: name, OK: err == nil, ElapsedMS: float64(time.Since(start)) / float64(time.Millisecond), Status: status}
 	if err != nil {
@@ -173,7 +182,7 @@ func Dial(ctx context.Context, target *url.URL, raw, profile string, forceH1 boo
 	}
 	start := time.Now()
 	conn, err = (&net.Dialer{}).DialContext(ctx, "tcp", addr)
-	if err = add(stages, "tcp", start, err, 0); err != nil {
+	if err = add(stages, "tcp", start, ContextError(ctx, err), 0); err != nil {
 		return nil, info, err
 	}
 	rawConn := conn
@@ -193,7 +202,7 @@ func Dial(ctx context.Context, target *url.URL, raw, profile string, forceH1 boo
 		outer := tls.Client(conn, &tls.Config{RootCAs: roots, ServerName: p.Hostname(), NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12})
 		conn = outer
 		err = outer.HandshakeContext(ctx)
-		if err = add(stages, "proxy_tls", start, err, 0); err != nil {
+		if err = add(stages, "proxy_tls", start, ContextError(ctx, err), 0); err != nil {
 			return nil, info, err
 		}
 	}
@@ -210,7 +219,7 @@ func Dial(ctx context.Context, target *url.URL, raw, profile string, forceH1 boo
 		if e == nil {
 			conn, e = d.(proxy.ContextDialer).DialContext(ctx, "tcp", originAddr)
 		}
-		if err = add(stages, "socks5", start, e, 0); err != nil {
+		if err = add(stages, "socks5", start, ContextError(ctx, e), 0); err != nil {
 			return nil, info, err
 		}
 	} else if p != nil && secure {
@@ -247,7 +256,7 @@ func Dial(ctx context.Context, target *url.URL, raw, profile string, forceH1 boo
 				}
 			}
 		}
-		if err = add(stages, "connect", start, e, status); err != nil {
+		if err = add(stages, "connect", start, ContextError(ctx, e), status); err != nil {
 			return nil, info, err
 		}
 	}
@@ -293,7 +302,7 @@ func Dial(ctx context.Context, target *url.URL, raw, profile string, forceH1 boo
 				info.ALPN = s.NegotiatedProtocol
 			}
 		}
-		if err = add(stages, "tls", start, err, 0); err != nil {
+		if err = add(stages, "tls", start, ContextError(ctx, err), 0); err != nil {
 			return nil, info, err
 		}
 		if forceH1 && info.ALPN != "" && info.ALPN != "http/1.1" {

@@ -70,6 +70,27 @@ func origins(t *testing.T) (*httptest.Server, *x509.CertPool) {
 	roots.AddCert(s.Certificate())
 	return s, roots
 }
+
+func TestHTTPResponseEvidenceSurvivesBodyTimeout(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(200)
+		w.Write([]byte("x"))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer origin.Close()
+	r := Check(context.Background(), Config{URL: origin.URL, Profile: "stdlib", TimeoutSeconds: .15})
+	if r.HTTPStatus != 200 || r.FailedStage != "body" || r.ErrorCode != "timeout" || r.TargetOK || r.TransportOK {
+		t.Fatalf("incorrect body-timeout outcome: %+v", r)
+	}
+	encoded, _ := json.Marshal(r)
+	var fields map[string]any
+	json.Unmarshal(encoded, &fields)
+	if fields["http_response_received"] != true || fields["body_read_ok"] != false || fields["body_complete"] != false {
+		t.Fatalf("HTTP evidence was lost: %s", encoded)
+	}
+}
 func TestProfilesThroughAuthenticatedConnectAndHTTP2(t *testing.T) {
 	origin, roots := origins(t)
 	auth := "Basic " + base64.StdEncoding.EncodeToString([]byte("alice:p@ss"))
@@ -79,7 +100,7 @@ func TestProfilesThroughAuthenticatedConnectAndHTTP2(t *testing.T) {
 		t.Run(profile, func(t *testing.T) {
 			cfg := Config{ID: "test", URL: origin.URL, Proxy: strings.Replace(p.URL, "http://", "http://alice:p%40ss@", 1), Profile: profile, TimeoutSeconds: 3, RootCAs: roots}
 			r := Check(context.Background(), cfg)
-			if !r.TargetOK || !r.TransportOK || r.HTTPVersion != "HTTP/2.0" || r.TLS.ALPN != "h2" || r.ReportedEgressIP != "203.0.113.9" {
+			if !r.TargetOK || !r.TransportOK || !r.HTTPResponseReceived || !r.BodyReadOK || !r.BodyComplete || r.HTTPVersion != "HTTP/2.0" || r.TLS.ALPN != "h2" || r.ReportedEgressIP != "203.0.113.9" {
 				t.Fatalf("invalid result %+v", r)
 			}
 			if strings.Contains(r.Proxy, "alice") || strings.Contains(r.Proxy, "p@ss") {
@@ -135,7 +156,7 @@ func TestHTTPForwardAbsoluteFormAndBoundedBody(t *testing.T) {
 	defer p.Close()
 	for _, profile := range []string{"stdlib", "chrome_152"} {
 		r := Check(context.Background(), Config{URL: "http://no-client-dns.invalid/path", Proxy: p.URL, Profile: profile, TimeoutSeconds: 2})
-		if !r.TransportOK || !r.BodyTruncated || r.BodyBytes != 65537 {
+		if !r.TransportOK || !r.BodyTruncated || !r.HTTPResponseReceived || !r.BodyReadOK || r.BodyComplete || r.BodyBytes != 65537 {
 			t.Fatalf("bounded HTTP %+v", r)
 		}
 	}

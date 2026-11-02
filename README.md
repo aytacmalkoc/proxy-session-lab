@@ -272,6 +272,13 @@ include probes, successes, failures, and interrupted navigations. Median/p95 use
 the latest 2048 samples; mean/min/max in JSONL span the full run. CPU peaks are
 peaks of sampled system-wide utilization, not continuous per-process profiling.
 
+Network-engine diagnostics include per-stage timeout counts, HTTP-response/body
+evidence and hybrid handoff latency. Ready browser work has priority over new Go
+prechecks within the same global rate limit. Session-correlated context/request
+events and a local-only network configuration digest help investigate grouped
+failures without recording IP/MAC/interface details. See the
+[network engine guide](docs/NETWORK_ENGINE.md#hybrid-scheduling-and-stage-diagnostics).
+
 ### Save structured performance data
 
 ```bash

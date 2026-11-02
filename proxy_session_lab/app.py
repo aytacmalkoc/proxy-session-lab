@@ -2,7 +2,7 @@
 """Finite synthetic browser sessions on Linux, macOS, and Windows."""
 import argparse
 import asyncio
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import suppress
 import ipaddress
 import json
@@ -22,7 +22,7 @@ from .telemetry import EventLog, Timings
 from .engine import EngineClient, EngineError
 from .runtime_support import (Resources, ResourceMonitor, ShutdownSignals,
                               cache_directory, configure_browser_path, descendants,
-                              is_root, process_snapshot)
+                              is_root, process_snapshot, network_snapshot)
 
 ROOT = Path(__file__).resolve().parent
 HEADER = 'X-Synthetic-Test-Run'
@@ -191,26 +191,41 @@ class Controller:
 
 
 class NavigationGate:
-    """No catch-up bursts. Probe and target page.goto share this rate limit."""
+    """One no-burst rate limit, with ready browser work ahead of prechecks."""
     def __init__(self, rate, stopping):
         self.interval = 1 / rate
         self.next_start = 0.0
-        self.lock = asyncio.Lock()
+        self.condition = asyncio.Condition()
+        self.waiters = []
+        self.sequence = 0
         self.stopping = stopping
         self.starts = 0
 
-    async def acquire(self):
-        async with self.lock:
-            delay = self.next_start - time.monotonic()
-            if delay > 0:
-                try:
-                    await asyncio.wait_for(self.stopping.wait(), delay)
-                except asyncio.TimeoutError:
-                    pass
-            if self.stopping.is_set():
-                raise asyncio.CancelledError()
-            self.next_start = time.monotonic() + self.interval
-            self.starts += 1
+    async def acquire(self, *, priority=0, kind='browser'):
+        async with self.condition:
+            ticket = (priority, self.sequence, kind)
+            self.sequence += 1
+            self.waiters.append(ticket)
+            self.condition.notify_all()
+            try:
+                while True:
+                    if self.stopping.is_set():
+                        raise asyncio.CancelledError()
+                    delay = self.next_start - time.monotonic()
+                    if ticket == min(self.waiters) and delay <= 0:
+                        self.next_start = time.monotonic() + self.interval
+                        self.starts += 1
+                        return
+                    # wait() releases the condition, so a higher-priority job
+                    # can enter during the interval. Poll only for global stop.
+                    wait = min(max(delay, .001), .25) if ticket == min(self.waiters) else .25
+                    try:
+                        await asyncio.wait_for(self.condition.wait(), wait)
+                    except asyncio.TimeoutError:
+                        pass
+            finally:
+                self.waiters.remove(ticket)
+                self.condition.notify_all()
 
 
 class BrowserProxyUnsupported(ValueError):
@@ -388,8 +403,12 @@ class Runner:
         self.counts = Counter()
         self.errors = Counter()
         self.network_errors = Counter()
+        self.timeout_stages = Counter()
+        self.network_stages = defaultdict(Counter)
         self.navigation_times = Timings()
         self.network_times = Timings()
+        self.handoff_times = Timings()
+        self.network_state = None
         self.network_engine = None
         self.session_times = Timings()
         self.active = 0
@@ -438,8 +457,14 @@ class Runner:
             'started_per_s': self.counts['started'] / elapsed,
             'finished_per_s': self.counts['finished'] / elapsed,
             'queue_depth': self.queue.qsize(),
+            'rate_waiters': len(self.gate.waiters),
+            'browser_rate_waiters': sum(w[2] == 'browser' for w in self.gate.waiters),
+            'network_rate_waiters': sum(w[2] == 'network' for w in self.gate.waiters),
             'navigation': self.navigation_times.snapshot(),
             'network': self.network_times.snapshot(),
+            'hybrid_handoff': self.handoff_times.snapshot(),
+            'timeouts_by_stage': dict(self.timeout_stages),
+            'network_stages': {name: dict(counts) for name, counts in self.network_stages.items()},
             'session': self.session_times.snapshot(),
             'peak_cpu_percent': self.peak_cpu,
             'peak_app_rss_mib': self.peak_app_rss / MIB,
@@ -470,6 +495,9 @@ class Runner:
         self.log(f'PERF elapsed_s={perf["elapsed_s"]:.1f} success={success} '
                  f'finished_per_s={perf["finished_per_s"]:.2f} queue={perf["queue_depth"]} '
                  f'nav_median_s={median} nav_p95_s={p95} nav_window={nav["window_count"]} network_median_s={net_median} '
+                 f'net_timeouts={c["network_timeout"]} browser_timeouts={c["browser_timeout"]} '
+                 f'http_responses={c["http_responses_received"]}/{c["http_checks"]} '
+                 f'rate_waiters={perf["rate_waiters"]} '
                  f'CPU_peak={self.peak_cpu:.0f}% RSS_app_peak~{self.peak_app_rss / MIB:.0f}MiB '
                  f'RSS_Chromium_peak~{self.peak_browser_rss / MIB:.0f}MiB',
                  event='performance', final=final, **perf)
@@ -477,6 +505,13 @@ class Runner:
     async def watch(self):
         next_report = time.monotonic()
         while not self.stopping.is_set():
+            state = network_snapshot()
+            if state != self.network_state:
+                changed = self.network_state is not None
+                self.events.emit('network_state_change' if changed else 'network_state', **state)
+                if changed:
+                    self.counts['local_network_state_changes'] += 1
+                self.network_state = state
             self.sample_resources()
             if self.controller.update(self.resources, self.active):
                 self.log(f'Auto admission limit -> {self.controller.limit} (CPU/RAM/observed active sessions)')
@@ -485,9 +520,15 @@ class Runner:
                 next_report = time.monotonic() + 5
             await asyncio.sleep(1)
 
-    async def navigate(self, page, url, role='target'):
-        await self.gate.acquire()
+    async def navigate(self, page, url, role='target', session_number=None, ready_at=None):
+        queued = time.monotonic()
+        await self.gate.acquire(kind='browser')
         start = time.monotonic()
+        if ready_at is not None:
+            self.handoff_times.observe(start - ready_at)
+        self.events.emit('navigation_started', session_number=session_number, role=role,
+                         rate_wait_s=start - queued,
+                         hybrid_handoff_s=start - ready_at if ready_at is not None else None)
         response = None
         observed_status = None
         def observed(res):
@@ -503,27 +544,53 @@ class Runner:
             self.navigation_times.observe(duration)
             page.remove_listener('response', observed)
             self.events.emit('navigation', role=role, duration_s=duration,
+                             session_number=session_number, rate_wait_s=start - queued,
+                             hybrid_handoff_s=start - ready_at if ready_at is not None else None,
                              http_status=response.status if response else observed_status)
 
-    async def network_check(self, url, proxy, role, test='http'):
-        await self.gate.acquire()
+    async def network_check(self, url, proxy, role, test='http', session_number=None):
+        queued = time.monotonic()
+        await self.gate.acquire(priority=1 if self.args.engine == 'hybrid' else 0, kind='network')
+        start = time.monotonic()
+        self.events.emit('network_check_started', session_number=session_number, role=role,
+                         profile=self.args.tls_profile, test=test, rate_wait_s=start - queued)
         report = await self.network_engine.check(
             url=url, proxy=proxy, profile=self.args.tls_profile,
             timeout=self.args.navigation_timeout, test=test,
             decoder=self.args.decoder, expect_text=self.args.expect_text if role == 'target' and test == 'http' else '')
         self.network_times.observe(report['elapsed_ms'] / 1000)
-        self.events.emit('network_check', role=role, **report)
+        self.events.emit('network_check', role=role, session_number=session_number,
+                         rate_wait_s=start - queued, **report)
         self.counts['transport_checks_ok' if report['transport_ok'] else 'transport_checks_failed'] += 1
+        for stage in report.get('stages', []):
+            values = self.network_stages[stage['name']]
+            values['attempted'] += 1
+            values['passed' if stage['ok'] else 'failed'] += 1
+        if test == 'http':
+            self.counts['http_checks'] += 1
+            for field in ('http_response_received', 'body_read_ok', 'body_complete'):
+                if report.get(field):
+                    self.counts[{'http_response_received': 'http_responses_received',
+                                 'body_read_ok': 'body_reads_ok', 'body_complete': 'bodies_complete'}[field]] += 1
+        code = report.get('error_code', '')
+        if code == 'timeout' or code.endswith('_timeout'):
+            self.counts['timeout'] += 1
+            self.counts['network_timeout'] += 1
+            self.timeout_stages[report.get('failed_stage', 'network')] += 1
         if report.get('stop_run'):
             self.stop(f'Network {role} HTTP {report.get("http_status")}; global target/probe stop')
         return report
 
-    async def close_session(self, context, header_tasks):
+    async def close_session(self, context, header_tasks, session_number=None):
         if context is not None:
+            self.events.emit('context_closing', session_number=session_number)
             try:
                 await asyncio.wait_for(context.close(), 3)
             except Exception:
                 self.stop('Context cleanup failed; closing Chromium')
+                self.events.emit('context_close_failed', session_number=session_number)
+            else:
+                self.events.emit('context_closed', session_number=session_number)
             finally:
                 self.contexts.discard(context)
         pending = tuple(header_tasks)
@@ -543,6 +610,7 @@ class Runner:
         phase = 'context_setup'
         network_error = None
         transport_ok = None
+        handoff_ready_at = None
         self.counts['started'] += 1
         self.active += 1
         self.peak_active = max(self.peak_active, self.active)
@@ -550,7 +618,7 @@ class Runner:
             if self.args.engine != 'browser':
                 if self.args.probe_url:
                     phase = 'network_probe'
-                    evidence = await self.network_check(self.args.probe_url, proxy, 'probe')
+                    evidence = await self.network_check(self.args.probe_url, proxy, 'probe', session_number=number)
                     transport_ok = evidence['transport_ok']
                     if not evidence['target_ok']:
                         status = evidence.get('http_status')
@@ -559,7 +627,7 @@ class Runner:
                         self.errors[outcome] += 1
                         return
                 phase = 'network_target'
-                evidence = await self.network_check(self.args.url, proxy, 'target', self.args.check)
+                evidence = await self.network_check(self.args.url, proxy, 'target', self.args.check, session_number=number)
                 transport_ok = evidence['transport_ok']
                 network_seconds = evidence['elapsed_ms'] / 1000
                 status = evidence.get('http_status')
@@ -573,14 +641,25 @@ class Runner:
                     self.counts['ok'] += 1
                     return
                 self.counts['network_passed_before_browser'] += 1
+                handoff_ready_at = time.monotonic()
                 status = None
                 phase = 'context_setup'
             # Chromium otherwise bypasses the configured proxy for loopback URLs.
+            self.events.emit('context_opening', session_number=number, proxy=safe_url(proxy))
             context = await browser.new_context(
                 proxy=browser_proxy(proxy), ignore_https_errors=False)
             self.contexts.add(context)
+            self.events.emit('context_opened', session_number=number)
             page = await context.new_page()
             header_tasks = await install_run_header(context, page, self.args.url, self.run_id)
+
+            def request_failed(request):
+                if request.is_navigation_request() and request.frame == page.main_frame:
+                    match = re.search(r'(ERR_[A-Z0-9_]+)', request.failure or '')
+                    self.events.emit('browser_request_failed', session_number=number,
+                                     error_code=match[1] if match else 'unknown',
+                                     local_network=network_snapshot())
+            page.on('requestfailed', request_failed)
 
             def response_received(response):
                 nonlocal status, transport_ok
@@ -594,7 +673,9 @@ class Runner:
 
             if self.args.probe_url:
                 phase = 'probe'
-                probe, _ = await self.navigate(page, self.args.probe_url, role='probe')
+                probe, _ = await self.navigate(page, self.args.probe_url, role='probe',
+                                               session_number=number, ready_at=handoff_ready_at)
+                handoff_ready_at = None
                 if probe is None or probe.status >= 400:
                     outcome = 'probe_http_error'
                     self.counts['failed'] += 1
@@ -615,7 +696,8 @@ class Runner:
                 await probe_cdp.detach()
                 status = None
             phase = 'target_navigation'
-            response, nav_seconds = await self.navigate(page, self.args.url)
+            response, nav_seconds = await self.navigate(page, self.args.url,
+                                                       session_number=number, ready_at=handoff_ready_at)
             status = response.status if response else status
             if response is None or status >= 400:
                 outcome = 'target_http_error' if response else 'no_main_response'
@@ -647,6 +729,8 @@ class Runner:
             self.counts['failed'] += 1
             if outcome == 'navigation_timeout':
                 self.counts['timeout'] += 1
+                self.counts['browser_timeout'] += 1
+                self.timeout_stages['browser_' + phase] += 1
             if outcome == 'resource_exhaustion':
                 self.controller.resource_error()
             if outcome == 'browser_context_crash' and not browser.is_connected():
@@ -661,7 +745,7 @@ class Runner:
         finally:
             # Keep close and bookkeeping alive even if another cancellation
             # arrives after the session has already entered its finally block.
-            cleanup = asyncio.create_task(self.close_session(context, header_tasks))
+            cleanup = asyncio.create_task(self.close_session(context, header_tasks, session_number=number))
             cancelled_during_cleanup = False
             try:
                 while not cleanup.done():
@@ -781,6 +865,7 @@ class Runner:
                  event='summary', reason=self.stop_reason or 'session budget/proxy candidates exhausted',
                  counts=dict(self.counts), active=self.active, peak_active=self.peak_active,
                  errors=dict(self.errors), network_errors=dict(self.network_errors),
+                 timeouts_by_stage=dict(self.timeout_stages),
                  performance=self.performance())
         self.log('Navigation success does not prove a counter increment or a real person/device visit. '
                  'Without real-target measurements, start with 2 active synthetic sessions.')

@@ -3,6 +3,34 @@
 Branch: `codex/proxy-network-engine`, based on proxy-session-lab `dcce328`.
 The imported kickpop source is identified in [engine provenance](../engine/PROVENANCE.md).
 
+## Linux scheduling and evidence fixes — 2 November 2026
+
+The follow-up local build on CachyOS/Python 3.14.8/Go 1.27.3 adds ready-browser
+priority within the single global rate gate, per-stage timeout accounting,
+HTTP-response/body evidence, session-correlated lifecycle events, and a redacted
+local interface configuration digest. No dependencies or target-success criteria
+were relaxed.
+
+Before the fixes, local regressions failed for browser handoff order, Go timeout
+counting, and HTTP evidence after a body deadline. After the fixes:
+
+- The full Python suite passed **47 tests**. The six-session hybrid fixture
+  began browser navigation at 0.318s while the last Go check finished at 1.227s;
+  starts remained at least 0.100s apart with a configured 10/s global rate.
+  Observed handoff p95 was 0.099s in this lightweight local fixture. These are
+  scheduling observations, not remote performance/capacity predictions.
+- Go `go test -race ./...` passed (178 test/subtest pass events, four opt-in
+  capture/load/offline-input cases skipped); `go vet ./...` and the native engine
+  build passed. Synthetic FFmpeg proxy/decode checks were enabled locally.
+- Regressions cover priority/FIFO order, cancellation and stop cleanup, preserved
+  global rate, Go timeout totals, body-timeout evidence without false success,
+  bounded-body completion semantics, session correlation, and network-digest
+  stability/redaction/unavailable handling.
+
+No new public-proxy, Kick or third-party test traffic was sent. The source of the
+previous simultaneous `ERR_NETWORK_CHANGED` events is still unproven; the added
+diagnostics make that question observable rather than suppressing/retrying errors.
+
 ## Completed checks
 
 - Python: **42 tests passed in 23.052 seconds** on native macOS arm64, Python

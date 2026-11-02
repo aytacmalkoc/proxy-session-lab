@@ -7,7 +7,8 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 from urllib.parse import urlsplit
 
 from proxy_session_lab import app
@@ -167,6 +168,76 @@ class NetworkEngineTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(.1);task.cancel();await asyncio.gather(task,return_exceptions=True)
         await asyncio.wait_for(client.close(),6)
         self.assertIsNotNone(client.process.returncode)
+
+    async def test_hybrid_ready_navigation_precedes_unstarted_network_jobs(self):
+        proxies = [await self.proxy() for _ in range(6)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'events.jsonl'
+            args = options('--engine', 'hybrid', '--sessions', '6', '--concurrency', '6',
+                           '--max-concurrency', '6', '--navigation-rate', '10',
+                           '--settle-seconds', '0', '--log-file', str(path))
+            runner = app.Runner(args, logger=lambda _: None)
+            try:
+                await asyncio.wait_for(runner.execute([p.endpoint for p in proxies], precheck=False), 15)
+            finally:
+                runner.events.close()
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            checks = [r for r in records if r['event'] == 'network_check']
+            navigations = [r for r in records if r['event'] == 'navigation']
+            self.assertEqual(runner.counts['ok'], 6)
+            # A successful precheck must not sit behind the entire first wave.
+            first_browser_start = min(r['elapsed_s'] - r['duration_s'] for r in navigations)
+            self.assertLess(first_browser_start, max(r['elapsed_s'] for r in checks))
+            self.assertEqual({r['session_number'] for r in checks}, set(range(1, 7)))
+            self.assertEqual({r['session_number'] for r in navigations}, set(range(1, 7)))
+            starts = sorted(r['elapsed_s'] for r in records
+                            if r['event'] in ('network_check_started', 'navigation_started'))
+            self.assertEqual(len(starts), 12)
+            self.assertTrue(all(b-a >= .09 for a, b in zip(starts, starts[1:])), starts)
+            self.assertEqual(len([r for r in records if r['event'] == 'context_closed']), 6)
+            self.assertEqual(runner.handoff_times.count, 6)
+            print('HYBRID_SCHEDULING', json.dumps({
+                'first_browser_start_s': first_browser_start,
+                'last_network_check_completed_s': max(r['elapsed_s'] for r in checks),
+                'minimum_global_start_gap_s': min(b-a for a, b in zip(starts, starts[1:])),
+                'handoff': runner.handoff_times.snapshot()}))
+            self.assertEqual(surviving_browser_pids(runner), [])
+
+    async def test_go_timeout_updates_total_and_network_stage_counters(self):
+        proxy = await self.proxy('hang')
+        runner = app.Runner(options('--engine', 'network', '--sessions', '1',
+                                    '--navigation-timeout', '.15'), logger=lambda _: None)
+        try:
+            await asyncio.wait_for(runner.execute([proxy.endpoint], precheck=False), 5)
+        finally:
+            runner.events.close()
+        self.assertEqual(runner.counts['failed'], 1)
+        self.assertEqual(runner.counts['timeout'], 1)
+        self.assertEqual(runner.counts['network_timeout'], 1)
+        self.assertEqual(runner.timeout_stages['http'], 1)
+
+
+class EvidenceAccountingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_partial_http_evidence_does_not_turn_failure_into_success(self):
+        report = {'id': 'fixture', 'elapsed_ms': 150, 'transport_ok': False,
+                  'target_ok': False, 'http_status': 200, 'http_response_received': True,
+                  'body_read_ok': False, 'body_complete': False,
+                  'failed_stage': 'body', 'error_code': 'timeout',
+                  'stages': [{'name': 'http', 'ok': True},
+                             {'name': 'body', 'ok': False, 'code': 'timeout'}]}
+        runner = app.Runner(options('--engine', 'network'), logger=lambda _: None)
+        runner.network_engine = SimpleNamespace(check=AsyncMock(return_value=report))
+        try:
+            result = await runner.network_check('http://fixture.test', '', 'target', session_number=3)
+            self.assertFalse(result['target_ok'])
+            self.assertEqual(runner.counts['timeout'], 1)
+            self.assertEqual(runner.counts['http_responses_received'], 1)
+            self.assertEqual(runner.counts['body_reads_ok'], 0)
+            self.assertEqual(runner.counts['transport_checks_failed'], 1)
+            self.assertEqual(runner.network_stages['body']['failed'], 1)
+            self.assertEqual(runner.performance()['timeouts_by_stage'], {'body': 1})
+        finally:
+            runner.events.close()
 
 class ResourcePolicyTests(unittest.TestCase):
     def test_lightweight_network_jobs_do_not_require_browser_memory_reserve(self):

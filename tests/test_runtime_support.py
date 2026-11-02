@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -17,6 +18,21 @@ from proxy_session_lab import app, runtime_support as runtime
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_network_digest_is_local_and_redacts_addresses(self):
+        stats = {'private-adapter-name': SimpleNamespace(isup=True, mtu=1500)}
+        addresses = {'private-adapter-name': [SimpleNamespace(family=2, address='10.1.2.3')]}
+        with patch.object(psutil, 'net_if_stats', return_value=stats), \
+             patch.object(psutil, 'net_if_addrs', return_value=addresses):
+            first = runtime.network_snapshot()
+            self.assertEqual(first, runtime.network_snapshot())
+            addresses['private-adapter-name'][0].address = '10.1.2.4'
+            self.assertNotEqual(first['state_id'], runtime.network_snapshot()['state_id'])
+        self.assertNotIn('10.1.2', json.dumps(first))
+        self.assertNotIn('private-adapter-name', json.dumps(first))
+        self.assertEqual(first['up_interface_count'], 1)
+        with patch.object(psutil, 'net_if_stats', side_effect=PermissionError()):
+            self.assertEqual(runtime.network_snapshot(), {'available': False})
+
     def test_resource_monitor_counts_only_our_process_tree_on_each_os(self):
         pid = os.getpid()
         snapshot = {
@@ -122,6 +138,30 @@ class RuntimeTests(unittest.TestCase):
 
 
 class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ready_browser_priority_keeps_global_rate_and_cancellation(self):
+        stop = asyncio.Event()
+        gate = app.NavigationGate(25, stop)
+        starts = []
+        async def job(name, priority):
+            await gate.acquire(priority=priority, kind='network' if priority else 'browser')
+            starts.append((name, time.monotonic()))
+        await job('initial', 1)
+        queued = [asyncio.create_task(job(f'network-{i}', 1)) for i in range(4)]
+        await asyncio.sleep(0)
+        cancelled = asyncio.create_task(job('cancelled', 0))
+        await asyncio.sleep(0)
+        cancelled.cancel()
+        await asyncio.gather(cancelled, return_exceptions=True)
+        browser = asyncio.create_task(job('ready-browser', 0))
+        await asyncio.wait_for(asyncio.gather(*queued, browser), 2)
+        self.assertEqual(starts[1][0], 'ready-browser')
+        self.assertEqual([name for name, _ in starts[2:]], [f'network-{i}' for i in range(4)])
+        self.assertTrue(all(b[1]-a[1] >= .035 for a, b in zip(starts, starts[1:])), starts)
+        self.assertEqual(gate.waiters, [])
+        stop.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await gate.acquire()
+        self.assertEqual(gate.waiters, [])
     async def test_rate_gate_waits_without_turning_delay_into_failure(self):
         gate = app.NavigationGate(100, asyncio.Event())
         await gate.acquire()
