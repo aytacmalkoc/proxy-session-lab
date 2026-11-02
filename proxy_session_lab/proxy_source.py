@@ -3,7 +3,7 @@ import ipaddress
 import ssl
 import sys
 import urllib.request
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, unquote
 
 SOURCE = 'https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt'
 MAX_BYTES = 2 * 1024 * 1024
@@ -35,6 +35,37 @@ def parse_proxies(text):
         if endpoint not in seen:
             seen.add(endpoint)
             candidates.append(endpoint)
+    return candidates
+
+
+class ProxyInputError(ValueError):
+    pass
+
+
+def parse_user_proxies(text):
+    """Explicit user lists can include authenticated HTTP/HTTPS/SOCKS5 or local endpoints."""
+    candidates, seen = [], set()
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        try:
+            u = urlsplit(line)
+            if (u.scheme not in ('http', 'https', 'socks5') or not u.hostname
+                    or not u.port or not 1 <= u.port <= 65535
+                    or u.path not in ('', '/') or u.query or u.fragment
+                    or any(ord(c) <= 32 or ord(c) == 127 for c in line)):
+                raise ProxyInputError()
+        except (ValueError, TypeError):
+            raise ProxyInputError(f'Invalid proxy URL at line {number}; expected scheme://[user:password@]host:port') from None
+        if any(c in unquote(u.username or '') + unquote(u.password or '') for c in ('\r', '\n', '\x00')):
+            raise ProxyInputError(f'Invalid proxy credentials at line {number}')
+        normalized = line.rstrip('/')
+        if normalized not in seen:
+            candidates.append(normalized)
+            seen.add(normalized)
+    if not candidates:
+        raise ProxyInputError('Proxy input contains no candidates')
     return candidates
 
 

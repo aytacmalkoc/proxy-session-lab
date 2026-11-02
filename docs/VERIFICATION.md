@@ -1,5 +1,8 @@
 # Verification notes
 
+The Go/network integration has a separate [2 November 2026 verification record](NETWORK_ENGINE_VERIFICATION.md).
+The notes below describe the earlier browser-only release.
+
 ## Cross-platform update
 
 The application now targets Python 3.11+ on Linux, macOS, and Windows.

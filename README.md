@@ -1,8 +1,10 @@
 # Proxy Session Lab
 
-A terminal-only tool for controlled, finite synthetic browser sessions against
-a web application you own. Built with Python, `asyncio`, Playwright, and Chromium,
-using HTTP proxy candidates from Proxifly's free list.
+A terminal-only tool for controlled, finite proxy diagnostics against a web
+application you own. Python/asyncio manages bounded jobs; a Go engine supplies
+standard/Chrome TLS, HTTP/2, WSS and media tests. Playwright/Chromium supplies
+optional isolated browser validation. Use explicit proxy inputs or the default
+Proxifly HTTP candidate list.
 
 **One Chromium browser. Isolated contexts. Bounded concurrency. A separate
 navigation rate limit. No web UI or results database.**
@@ -10,6 +12,27 @@ navigation rate limit. No web UI or results database.**
 Successful navigation does not prove a page-view counter increment, a verified
 egress IP, or a visit by a real person or physical device. Observe your counter
 in your own application.
+
+## Go network engine and TLS profile selection
+
+The integrated **network** mode checks proxies without launching Chromium;
+**hybrid** runs Go HTTP checks before allocating an isolated browser context.
+The pinned `stdlib` and `chrome_152` profiles provide an explicit TLS/H2 comparison.
+HTTP/HTTPS CONNECT and SOCKS5 (including network-mode authentication) are supported.
+Existing browser-only commands remain the default.
+
+```sh
+./scripts/build_engine.sh  # Go 1.27+
+./run.sh https://your-app.example/health --engine network --tls-profile chrome_152 \
+  --proxy-file proxies.txt --sessions 20 --concurrency 4 --max-concurrency 4 \
+  --seed 42 --log-file logs/network.jsonl
+```
+
+[Build instructions, proxy inputs, capability tests and result semantics](docs/NETWORK_ENGINE.md).
+[Integration verification and remaining acceptance](docs/NETWORK_ENGINE_VERIFICATION.md).
+The Go engine also exposes verified WSS upgrade, bounded media access and full finite
+HLS decode using the imported kickpop components. Full decode requires local FFmpeg.
+Every report separates transport evidence from target/session success.
 
 ## Quick start
 
@@ -160,7 +183,7 @@ It samples CPU, available RAM, and process memory through psutil and may
 increase the limit by one every five seconds when current slots are occupied
 and resources permit.
 
-Approximately 25% of total RAM is reserved, with an extra 128 MiB admission
+For browser/media/decode work, approximately 25% of total RAM is reserved, with an extra 128 MiB admission
 margin. Sustained high CPU (three samples at 85% or higher), low RAM, or an
 explicit resource-exhaustion error reduces or delays admission. Active sessions
 are not killed merely to reduce this limit. Fixed concurrency also observes

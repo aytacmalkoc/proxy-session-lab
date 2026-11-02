@@ -29,7 +29,7 @@ def options(*items):
     return app.arguments(['http://synthetic.test/test', '--sessions', '4',
                           '--concurrency', '2', '--max-concurrency', '2',
                           '--navigation-rate', '4', '--settle-seconds', '.4',
-                          '--max-duration', '15', *items])
+                          '--max-duration', '15', '--ram-reserve-percent', '10', *items])
 
 
 class LocalProxy:
@@ -152,7 +152,7 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(app.valid_url('https://example.test/'), 'https://example.test/')
 
     def test_auto_controller_resource_evidence(self):
-        c = app.Controller(options('--concurrency', 'auto', '--max-concurrency', '8', '--sessions', '20'))
+        c = app.Controller(options('--concurrency', 'auto', '--max-concurrency', '8', '--sessions', '20', '--ram-reserve-percent', '25'))
         r = app.Resources(total=32_000 * app.MIB, available=24_000 * app.MIB, cpu=10)
         self.assertEqual(c.limit, 2)
         c.last_change -= 6
@@ -221,6 +221,7 @@ class CleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
                 closing, release, opened = asyncio.Event(), asyncio.Event(), asyncio.Event()
                 class Page:
                     def on(self, *args): pass
+                    def remove_listener(self, *args): pass
                     async def goto(self, *args, **kwargs):
                         opened.set()
                         return SimpleNamespace(status=200)
@@ -462,7 +463,7 @@ sys.path.insert(0, sys.argv[1])
 from proxy_session_lab import app
 async def fixture(_): return [sys.argv[2]], "local-fixture"
 app.load_candidates = fixture
-sys.exit(asyncio.run(app.run(app.arguments(["http://synthetic.test/test", "--sessions", "1", "--settle-seconds", "60"]))))
+sys.exit(asyncio.run(app.run(app.arguments(["http://synthetic.test/test", "--sessions", "1", "--settle-seconds", "60", "--ram-reserve-percent", "10"]))))
 '''
         process_options = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {}
         proc = await asyncio.create_subprocess_exec(sys.executable, '-c', code, str(Path(app.__file__).parents[1]), p.endpoint,

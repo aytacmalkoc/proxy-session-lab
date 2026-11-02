@@ -8,3 +8,5 @@ logs/
 *.egg-info/
 build/
 dist/
+/engine/bin/
+/engine/artifacts/

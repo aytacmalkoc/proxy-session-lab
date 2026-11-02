@@ -14,11 +14,12 @@ import re
 import socket
 import sys
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, unquote
 import uuid
 
-from .proxy_source import SOURCE, MAX_BYTES, CACHE_SECONDS, parse_proxies
+from .proxy_source import SOURCE, MAX_BYTES, CACHE_SECONDS, parse_proxies, parse_user_proxies, ProxyInputError
 from .telemetry import EventLog, Timings
+from .engine import EngineClient, EngineError
 from .runtime_support import (Resources, ResourceMonitor, ShutdownSignals,
                               cache_directory, configure_browser_path, descendants,
                               is_root, process_snapshot)
@@ -30,7 +31,11 @@ MIB = 1024 ** 2
 
 def safe_url(url):
     """Never print URL userinfo (including in downloaded endpoints)."""
-    return re.sub(r'(https?://)[^/@\s]+@', r'\1***:***@', str(url))
+    u = urlsplit(str(url))
+    if not u.scheme:
+        return str(url)
+    host = u.netloc.rsplit('@', 1)[-1]
+    return u._replace(netloc=host, query='', fragment='').geturl()
 
 
 def origin(url):
@@ -41,7 +46,7 @@ def origin(url):
 def valid_url(value):
     try:
         u = urlsplit(value)
-        if (u.scheme not in ('http', 'https') or not u.hostname or not u.netloc
+        if (u.scheme not in ('http', 'https', 'wss') or not u.hostname or not u.netloc
                 or u.username is not None or u.password is not None
                 or any(ord(c) <= 32 or ord(c) == 127 for c in value)
                 or (u.port is not None and not 1 <= u.port <= 65535)):
@@ -96,6 +101,18 @@ def arguments(argv=None):
     p.add_argument('--probe-url', type=valid_url, help='Optional proxy diagnostics URL that you own')
     p.add_argument('--dry-run', action='store_true', help='Print configuration only; no network requests or browser')
     p.add_argument('--log-file', help='Append structured performance/events to a .jsonl file (default: no file)')
+    p.add_argument('--engine', choices=('browser', 'network', 'hybrid'), default='browser', help='Browser, Go network checks, or Go checks followed by Chromium')
+    p.add_argument('--tls-profile', choices=('stdlib', 'chrome_152'), default='stdlib', help='Go origin TLS/H2 profile; Chromium keeps its own TLS')
+    p.add_argument('--check', choices=('http', 'ws', 'media', 'decode'), default='http', help='Network capability; hybrid uses http')
+    source = p.add_mutually_exclusive_group()
+    source.add_argument('--proxy-file', help='UTF-8 file of explicit HTTP/HTTPS/SOCKS5 proxy URLs')
+    source.add_argument('--proxy', action='append', help='Explicit proxy URL; repeatable; prefer --proxy-file for credentials')
+    source.add_argument('--direct', action='store_true', help='Explicit direct reference; never used as a proxy fallback')
+    p.add_argument('--seed', type=int, help='Reproducible proxy order for the same candidate set')
+    p.add_argument('--engine-path', help='Path to the locally built Go worker')
+    p.add_argument('--decoder', default='ffmpeg', help='Local FFmpeg executable for --check decode')
+    p.add_argument('--expect-text', default='', help='Required marker in the bounded network HTTP response')
+    p.add_argument('--ram-reserve-percent', type=nonnegative, default=None, help='Available RAM reserve, 0..90 percent; default: network HTTP/WSS 10, other work 25')
     a = p.parse_args(argv)
     if a.url is None:
         if not sys.stdin.isatty():
@@ -108,6 +125,24 @@ def arguments(argv=None):
         p.error('--concurrency must not exceed --max-concurrency')
     if a.log_file and Path(a.log_file).suffix != '.jsonl':
         p.error('--log-file must use the .jsonl extension')
+    if a.engine != 'browser' and (a.max_concurrency > 100 or a.navigation_timeout > (120 if a.check == 'decode' else 60)):
+        p.error('network/hybrid supports at most 100 workers; timeout limit is 60s (decode: 120s)')
+    if a.engine != 'network' and a.check != 'http':
+        p.error('--check ws/media/decode requires --engine network')
+    if (a.check == 'ws') != (urlsplit(a.url).scheme == 'wss'):
+        p.error('--check ws requires wss://; other checks require HTTP(S)')
+    if a.engine != 'browser' and a.check in ('media', 'decode') and urlsplit(a.url).scheme != 'https':
+        p.error('media/decode currently require a direct HTTPS media URL')
+    if a.probe_url and urlsplit(a.probe_url).scheme not in ('http','https'):
+        p.error('--probe-url requires HTTP(S)')
+    if a.engine == 'browser' and a.tls_profile != 'stdlib':
+        p.error('--tls-profile configures the Go worker; select --engine network or hybrid')
+    if a.engine == 'browser' and a.expect_text:
+        p.error('--expect-text configures network HTTP validation; select network or hybrid')
+    if a.ram_reserve_percent is not None and a.ram_reserve_percent > 90:
+        p.error('--ram-reserve-percent must be between 0 and 90')
+    if len(a.expect_text.encode()) > 4096:
+        p.error('--expect-text is limited to 4096 UTF-8 bytes')
     return a
 
 
@@ -115,6 +150,10 @@ class Controller:
     """Admission only: never kills active sessions to reduce resource pressure."""
     def __init__(self, args):
         self.auto = args.concurrency == 'auto'
+        lightweight = args.engine == 'network' and args.check in ('http', 'ws')
+        self.reserve_fraction = (args.ram_reserve_percent / 100 if args.ram_reserve_percent is not None else .10 if lightweight else .25)
+        self.admission_margin = (32 if lightweight else 128) * MIB
+        self.growth_margin = (64 if lightweight else 256) * MIB
         self.maximum = min(args.max_concurrency, args.sessions)
         self.limit = min(2 if self.auto else args.concurrency, self.maximum)
         self.high_cpu = 0
@@ -134,20 +173,20 @@ class Controller:
         self.high_cpu = self.high_cpu + 1 if r.cpu >= 85 else 0
         now = time.monotonic()
         if self.auto:
-            if (self.high_cpu >= 3 or r.available < r.total * .25) and now - self.last_change >= 3:
+            if (self.high_cpu >= 3 or r.available < r.total * self.reserve_fraction) and now - self.last_change >= 3:
                 self.limit = max(1, self.limit - 1)
                 self.cooldown_until = now + 5
                 self.last_change = now
                 self.high_cpu = 0
             elif (now - self.last_change >= 5 and now >= self.cooldown_until
-                    and r.cpu < 75 and r.available > r.total * .25 + 256 * MIB
+                    and r.cpu < 75 and r.available > r.total * self.reserve_fraction + self.growth_margin
                     and active >= self.limit):
                 self.limit = min(self.maximum, self.limit + 1)
                 self.last_change = now
         return old != self.limit
 
     def admits(self, r):
-        return (r.available >= r.total * .25 + 128 * MIB
+        return (r.available >= r.total * self.reserve_fraction + self.admission_margin
                 and self.high_cpu < 3 and time.monotonic() >= self.cooldown_until)
 
 
@@ -174,7 +213,13 @@ class NavigationGate:
             self.starts += 1
 
 
+class BrowserProxyUnsupported(ValueError):
+    pass
+
+
 def classify_error(exc):
+    if isinstance(exc, BrowserProxyUnsupported):
+        return "browser_proxy_unsupported"
     s = str(exc).upper()
     if isinstance(exc, MemoryError) or any(x in s for x in ('OUT_OF_MEMORY', 'ENOMEM', 'NOT ENOUGH MEMORY', 'TOO MANY OPEN FILES', 'RESOURCE_EXHAUSTED')):
         return 'resource_exhaustion'
@@ -261,6 +306,44 @@ async def load_candidates(cache_dir):
     return candidates, source
 
 
+async def configured_candidates(args):
+    if args.direct:
+        return [''] * args.sessions, 'explicit direct reference'
+    if args.proxy_file:
+        path = Path(args.proxy_file).expanduser()
+        if not path.is_file() or path.stat().st_size > MAX_BYTES:
+            raise ProxyInputError('Proxy file must be a regular UTF-8 file no larger than 2 MiB')
+        with path.open('rb') as source:
+            data = source.read(MAX_BYTES + 1)
+        if len(data) > MAX_BYTES:
+            raise ProxyInputError('Proxy file exceeds the 2 MiB limit')
+        try:
+            candidates, source = parse_user_proxies(data.decode('utf-8')), 'explicit file'
+        except UnicodeDecodeError:
+            raise ProxyInputError('Proxy file must contain valid UTF-8') from None
+    elif args.proxy:
+        candidates, source = parse_user_proxies('\n'.join(args.proxy)), 'explicit URLs'
+    else:
+        candidates, source = await load_candidates(cache_directory())
+    if args.seed is not None:
+        candidates = sorted(candidates)
+        random.Random(args.seed).shuffle(candidates)
+    return candidates, source
+
+
+def browser_proxy(raw):
+    if not raw:
+        return None
+    u = urlsplit(raw)
+    host = u.netloc.rsplit('@', 1)[-1]
+    result = {'server': f'{u.scheme}://{host}', 'bypass': '<-loopback>'}
+    if u.username is not None:
+        if u.scheme == 'socks5':
+            raise BrowserProxyUnsupported('Authenticated SOCKS5 is supported by the network engine; Chromium does not support it')
+        result.update(username=unquote(u.username), password=unquote(u.password or ''))
+    return result
+
+
 async def preflight(url, log):
     host = urlsplit(url).hostname
     if host.lower().endswith(('.ts.net', '.localhost', '.local', '.test')) or host.lower() == 'localhost':
@@ -306,6 +389,8 @@ class Runner:
         self.errors = Counter()
         self.network_errors = Counter()
         self.navigation_times = Timings()
+        self.network_times = Timings()
+        self.network_engine = None
         self.session_times = Timings()
         self.active = 0
         self.peak_active = 0
@@ -348,10 +433,13 @@ class Runner:
         return {
             'elapsed_s': elapsed,
             'success_percent': 100 * self.counts['ok'] / resolved if resolved else None,
+            'success_basis': 'session_outcome',
+            'transport_checks_success_percent': (100 * self.counts['transport_checks_ok'] / (self.counts['transport_checks_ok'] + self.counts['transport_checks_failed']) if self.counts['transport_checks_ok'] + self.counts['transport_checks_failed'] else None),
             'started_per_s': self.counts['started'] / elapsed,
             'finished_per_s': self.counts['finished'] / elapsed,
             'queue_depth': self.queue.qsize(),
             'navigation': self.navigation_times.snapshot(),
+            'network': self.network_times.snapshot(),
             'session': self.session_times.snapshot(),
             'peak_cpu_percent': self.peak_cpu,
             'peak_app_rss_mib': self.peak_app_rss / MIB,
@@ -373,13 +461,15 @@ class Runner:
                  limit=self.controller.limit, navigations=self.gate.starts,
                  resources=vars(r))
         perf = self.performance()
+        net_stats = perf['network']
+        net_median = f'{net_stats["median_s"]:.2f}' if net_stats['median_s'] is not None else '-'
         nav = perf['navigation']
         median = f'{nav["median_s"]:.2f}' if nav['median_s'] is not None else '-'
         p95 = f'{nav["p95_s"]:.2f}' if nav['p95_s'] is not None else '-'
         success = f'{perf["success_percent"]:.1f}%' if perf['success_percent'] is not None else '-'
         self.log(f'PERF elapsed_s={perf["elapsed_s"]:.1f} success={success} '
                  f'finished_per_s={perf["finished_per_s"]:.2f} queue={perf["queue_depth"]} '
-                 f'nav_median_s={median} nav_p95_s={p95} nav_window={nav["window_count"]} '
+                 f'nav_median_s={median} nav_p95_s={p95} nav_window={nav["window_count"]} network_median_s={net_median} '
                  f'CPU_peak={self.peak_cpu:.0f}% RSS_app_peak~{self.peak_app_rss / MIB:.0f}MiB '
                  f'RSS_Chromium_peak~{self.peak_browser_rss / MIB:.0f}MiB',
                  event='performance', final=final, **perf)
@@ -399,14 +489,34 @@ class Runner:
         await self.gate.acquire()
         start = time.monotonic()
         response = None
+        observed_status = None
+        def observed(res):
+            nonlocal observed_status
+            if res.request.is_navigation_request() and res.request.frame == page.main_frame:
+                observed_status = res.status
+        page.on('response', observed)
         try:
             response = await page.goto(url, wait_until='domcontentloaded', timeout=self.args.navigation_timeout * 1000)
             return response, time.monotonic() - start
         finally:
             duration = time.monotonic() - start
             self.navigation_times.observe(duration)
+            page.remove_listener('response', observed)
             self.events.emit('navigation', role=role, duration_s=duration,
-                             http_status=response.status if response else None)
+                             http_status=response.status if response else observed_status)
+
+    async def network_check(self, url, proxy, role, test='http'):
+        await self.gate.acquire()
+        report = await self.network_engine.check(
+            url=url, proxy=proxy, profile=self.args.tls_profile,
+            timeout=self.args.navigation_timeout, test=test,
+            decoder=self.args.decoder, expect_text=self.args.expect_text if role == 'target' and test == 'http' else '')
+        self.network_times.observe(report['elapsed_ms'] / 1000)
+        self.events.emit('network_check', role=role, **report)
+        self.counts['transport_checks_ok' if report['transport_ok'] else 'transport_checks_failed'] += 1
+        if report.get('stop_run'):
+            self.stop(f'Network {role} HTTP {report.get("http_status")}; global target/probe stop')
+        return report
 
     async def close_session(self, context, header_tasks):
         if context is not None:
@@ -427,26 +537,57 @@ class Runner:
         header_tasks = set()
         started = time.monotonic()
         nav_seconds = None
+        network_seconds = None
         status = None
         outcome = 'cancelled'
         phase = 'context_setup'
         network_error = None
+        transport_ok = None
         self.counts['started'] += 1
         self.active += 1
         self.peak_active = max(self.peak_active, self.active)
         try:
+            if self.args.engine != 'browser':
+                if self.args.probe_url:
+                    phase = 'network_probe'
+                    evidence = await self.network_check(self.args.probe_url, proxy, 'probe')
+                    transport_ok = evidence['transport_ok']
+                    if not evidence['target_ok']:
+                        status = evidence.get('http_status')
+                        outcome = 'probe_' + evidence['error_code']
+                        self.counts['failed'] += 1
+                        self.errors[outcome] += 1
+                        return
+                phase = 'network_target'
+                evidence = await self.network_check(self.args.url, proxy, 'target', self.args.check)
+                transport_ok = evidence['transport_ok']
+                network_seconds = evidence['elapsed_ms'] / 1000
+                status = evidence.get('http_status')
+                if not evidence['target_ok']:
+                    outcome = evidence.get('failed_stage', 'network') + ':' + evidence['error_code']
+                    self.counts['failed'] += 1
+                    self.errors[outcome] += 1
+                    return
+                if self.args.engine == 'network':
+                    outcome = 'network_succeeded'
+                    self.counts['ok'] += 1
+                    return
+                self.counts['network_passed_before_browser'] += 1
+                status = None
+                phase = 'context_setup'
             # Chromium otherwise bypasses the configured proxy for loopback URLs.
             context = await browser.new_context(
-                proxy={'server': proxy, 'bypass': '<-loopback>'}, ignore_https_errors=False)
+                proxy=browser_proxy(proxy), ignore_https_errors=False)
             self.contexts.add(context)
             page = await context.new_page()
             header_tasks = await install_run_header(context, page, self.args.url, self.run_id)
 
             def response_received(response):
-                nonlocal status
+                nonlocal status, transport_ok
                 req = response.request
                 if req.is_navigation_request() and req.frame == page.main_frame:
                     status = response.status
+                    transport_ok = True
                     if status in (429, 503):
                         self.stop(f'Main response HTTP {status}; stopping without rotating to another proxy')
             page.on('response', response_received)
@@ -483,18 +624,25 @@ class Runner:
             else:
                 phase = 'settle'
                 await asyncio.sleep(self.args.settle_seconds)
-                outcome = 'navigation_succeeded'
-                self.counts['ok'] += 1
+                if status is None or status >= 400:
+                    outcome = 'target_http_error'
+                    self.counts['failed'] += 1
+                    self.errors[outcome] += 1
+                else:
+                    outcome = 'navigation_succeeded'
+                    self.counts['ok'] += 1
         except asyncio.CancelledError:
             self.counts['cancelled'] += 1
             if status in (429, 503):
-                outcome = 'target_http_error'
+                outcome = 'probe_http_error' if 'probe' in phase else 'target_http_error'
                 self.counts['failed'] += 1
                 self.counts['cancelled'] -= 1
                 self.errors[outcome] += 1
             raise
         except Exception as exc:
-            outcome = classify_error(exc)
+            outcome = 'engine_runtime' if isinstance(exc, EngineError) else classify_error(exc)
+            if isinstance(exc, EngineError):
+                self.stop('Network engine failed; inspect build/version and worker availability')
             self.errors[outcome] += 1
             self.counts['failed'] += 1
             if outcome == 'navigation_timeout':
@@ -534,7 +682,9 @@ class Runner:
                          event='session', session_number=number, proxy=safe_url(proxy),
                          http_status=status, result=outcome, phase=phase,
                          network_error=network_error, navigation_s=nav_seconds,
-                         duration_s=duration, active=self.active)
+                         duration_s=duration, active=self.active,
+                         transport_ok=transport_ok, engine=self.args.engine, network_s=network_seconds,
+                         tls_profile=self.args.tls_profile if self.args.engine != 'browser' else 'chromium_native')
             if cancelled_during_cleanup:
                 raise asyncio.CancelledError()
 
@@ -585,30 +735,40 @@ class Runner:
     async def execute(self, candidates=None, precheck=True):
         """candidates injection is an internal seam for loopback-only tests."""
         configure_browser_path()
-        from playwright.async_api import async_playwright
         self.log(f'target={safe_url(self.args.url)} synthetic_sessions={self.args.sessions} '
-                 f'initial_concurrency={self.controller.limit} rate={self.args.navigation_rate}/s',
-                 event='run_started', target=safe_url(self.args.url), config=vars(self.args))
+                 f'initial_concurrency={self.controller.limit} rate={self.args.navigation_rate}/s engine={self.args.engine} '
+                 f'tls_profile={self.args.tls_profile if self.args.engine != "browser" else "chromium_native"} check={self.args.check}',
+                 event='run_started', target=safe_url(self.args.url), config={**vars(self.args), 'proxy': [safe_url(p) for p in self.args.proxy] if self.args.proxy else None})
         self.log('Summed RSS includes shared pages; it is not exact physical RAM consumption.')
         browser = None
         try:
             if precheck:
                 await preflight(self.args.url, self.log)
             if candidates is None:
-                candidates, source = await load_candidates(cache_directory())
-                self.log(f'Proxifly {source}: {len(candidates)} distinct unverified candidates')
+                candidates, source = await configured_candidates(self.args)
+                self.log(f'Proxy source={source}: {len(candidates)} unverified candidate entries')
+            if self.args.engine != 'browser':
+                self.network_engine = await EngineClient(self.args.engine_path, self.controller.maximum).start()
+                self.events.emit('engine_started', **self.network_engine.protocol_info)
+            if self.args.engine == 'network':
+                await self.schedule(None, candidates)
+                return
+            from playwright.async_api import async_playwright
             async with async_playwright() as playwright:
                 try:
                     browser = await playwright.chromium.launch(
                         headless=not self.args.headed, chromium_sandbox=True,
                         handle_sigint=False, handle_sigterm=False, handle_sighup=False,
-                        timeout=min(30, self.args.max_duration) * 1000)
+                        timeout=min(30, self.args.max_duration) * 1000,
+                        args=['--no-proxy-server'] if self.args.direct else [])
                     await self.schedule(browser, candidates)
                 finally:
                     self.sample_resources()
                     if browser:
                         await asyncio.wait_for(browser.close(), 5)
         finally:
+            if self.network_engine is not None:
+                await self.network_engine.close()
             self.sample_resources()
 
     def summary(self):
@@ -649,7 +809,12 @@ async def run_until_stopped(runner):
         result = (await asyncio.gather(execution, return_exceptions=True))[0]
         if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
             runner.stop(f'Setup/runtime error: {type(result).__name__}')
-            runner.log('Check the Chromium installation, system libraries, sandbox, and Proxifly connectivity.')
+            if isinstance(result, (EngineError, ProxyInputError)):
+                runner.log(str(result))
+            elif args.engine == 'browser':
+                runner.log('Check the Chromium installation, system libraries, sandbox, and Proxifly connectivity.')
+            else:
+                runner.log('Check the network engine build/protocol, proxy input and runtime dependencies.')
             return 2
         if runner.stop_reason in ('SIGINT', 'SIGBREAK', 'SIGTERM', 'SIGHUP'):
             return 130 if runner.stop_reason in ('SIGINT', 'SIGBREAK') else 143
@@ -666,11 +831,13 @@ def main():
     args = arguments()
     if args.dry_run:
         config = vars(args).copy()
+        if config['proxy']:
+            config['proxy'] = [safe_url(p) for p in config['proxy']]
         config['run_id'] = uuid.uuid4().hex
-        config['proxy_source'] = SOURCE
+        config['proxy_source'] = ('explicit_file' if args.proxy_file else 'explicit_urls' if args.proxy else 'explicit_direct' if args.direct else SOURCE)
         config['initial_concurrency'] = min(2 if args.concurrency == 'auto' else args.concurrency,
                                             args.max_concurrency, args.sessions)
-        config['ram_reserve_percent'] = 25
+        config['ram_reserve_percent'] = (args.ram_reserve_percent if args.ram_reserve_percent is not None else 10 if args.engine == 'network' and args.check in ('http', 'ws') else 25)
         config['network_requests'] = 0
         print(json.dumps(config, ensure_ascii=False, indent=2))
         return 0
